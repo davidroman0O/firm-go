@@ -6,11 +6,206 @@ import (
 	"sync"
 )
 
+// ContextKey is used as a key type for context values
+type ContextKey string
+
 // Context represents a reactive execution context that can be used to
 // track and manage dependencies, similar to Solid.js createRoot
 type Context struct {
 	disposables []func()
 	parent      *Context
+	values      map[ContextKey]interface{}
+	mutex       sync.RWMutex
+	children    []*Context
+	disposed    bool
+}
+
+// CombineSources creates a computed value that depends on multiple signals
+func CombineSources[T any](sources []any, compute func() T) *Computed[T] {
+	return CreateComputed(func() T {
+		// Access all sources to create dependencies
+		for _, source := range sources {
+			switch s := source.(type) {
+			case *Signal[any]:
+				s.Get()
+			case *Computed[any]:
+				s.Get()
+			case *Signal[T]:
+				s.Get()
+			case *Computed[T]:
+				s.Get()
+			}
+		}
+
+		// Compute the result
+		return compute()
+	})
+}
+
+// CreateContextProvider creates a context with provided values
+func CreateContextProvider(values map[ContextKey]interface{}, fn func()) func() {
+	return CreateRoot(func() {
+		// Set all the provided values in the new context
+		for key, value := range values {
+			ProvideContext(key, value)
+		}
+
+		// Run the function
+		fn()
+	})
+}
+
+// RunWithContext executes a function with a specific context as active
+func RunWithContext(context *Context, fn func()) {
+	if context == nil {
+		fn()
+		return
+	}
+
+	// Save the current context
+	prevContext := activeContext
+
+	// Set the provided context as active
+	activeContext = context
+
+	// Run the function
+	fn()
+
+	// Restore the previous context
+	activeContext = prevContext
+}
+
+// GetActiveContext returns the currently active context
+func GetActiveContext() *Context {
+	return activeContext
+}
+
+// ListContextValues returns all key-value pairs in the current context chain
+// Useful for debugging
+func ListContextValues() map[ContextKey]interface{} {
+	result := make(map[ContextKey]interface{})
+
+	// Start with current context
+	ctx := activeContext
+	for ctx != nil {
+		ctx.mutex.RLock()
+		// Add values from current context (values in child contexts override parent values)
+		for k, v := range ctx.values {
+			if _, exists := result[k]; !exists {
+				result[k] = v
+			}
+		}
+		parent := ctx.parent
+		ctx.mutex.RUnlock()
+
+		// Move up to parent
+		ctx = parent
+	}
+
+	return result
+}
+
+// ContextCreator is a reusable pattern for creating contexts with standard values
+type ContextCreator struct {
+	baseValues map[ContextKey]interface{}
+}
+
+// NewContextCreator creates a new context creator with base values
+func NewContextCreator(baseValues map[ContextKey]interface{}) *ContextCreator {
+	if baseValues == nil {
+		baseValues = make(map[ContextKey]interface{})
+	}
+
+	return &ContextCreator{
+		baseValues: baseValues,
+	}
+}
+
+// CreateContext creates a new context with the base values plus additional values
+func (cc *ContextCreator) CreateContext(additionalValues map[ContextKey]interface{}, fn func()) func() {
+	// Merge base values with additional values
+	mergedValues := make(map[ContextKey]interface{})
+
+	for k, v := range cc.baseValues {
+		mergedValues[k] = v
+	}
+
+	for k, v := range additionalValues {
+		mergedValues[k] = v
+	}
+
+	// Create a context with the merged values
+	return CreateContextProvider(mergedValues, fn)
+}
+
+// CreateSignalCombo creates a signal and returns both the signal and a setter function
+// This provides a more ergonomic API similar to Solid.js createSignal
+func CreateSignalCombo[T any](initialValue T) (*Signal[T], func(T)) {
+	signal := NewSignal(initialValue)
+	setter := func(value T) {
+		signal.Set(value)
+	}
+	return signal, setter
+}
+
+// CreateSelector creates a derived signal that selects a part of another signal
+// More idiomatic name aligning with other Create* functions
+func CreateSelector[T any, R any](source *Signal[T], selector func(T) R) *Computed[R] {
+	return Selector(source, selector)
+}
+
+// WithContext runs code in a temporary context that inherits from the current context
+// More idiomatic version of an existing function to improve readability
+func WithContext(fn func()) {
+	parentContext := activeContext
+
+	// Create temporary context
+	tempContext := &Context{
+		disposables: make([]func(), 0),
+		parent:      parentContext,
+		values:      make(map[ContextKey]interface{}),
+		children:    make([]*Context, 0),
+		disposed:    false,
+	}
+
+	// Add as child to parent
+	if parentContext != nil {
+		parentContext.mutex.Lock()
+		parentContext.children = append(parentContext.children, tempContext)
+		parentContext.mutex.Unlock()
+	}
+
+	// Set as active context
+	contextStack = append(contextStack, activeContext)
+	activeContext = tempContext
+
+	// Run the function
+	fn()
+
+	// Collect cleanup hooks
+	for _, hook := range onCleanupHooks {
+		if hook != nil {
+			tempContext.disposables = append(tempContext.disposables, hook)
+		}
+	}
+	onCleanupHooks = nil
+
+	// Restore previous context
+	activeContext = contextStack[len(contextStack)-1]
+	contextStack = contextStack[:len(contextStack)-1]
+
+	// Add cleanup to parent context for later disposal
+	if parentContext != nil {
+		disposable := func() {
+			disposeContext(tempContext)
+		}
+		parentContext.mutex.Lock()
+		parentContext.disposables = append(parentContext.disposables, disposable)
+		parentContext.mutex.Unlock()
+	} else {
+		// If no parent, dispose immediately
+		disposeContext(tempContext)
+	}
 }
 
 // Memo represents a memoized value (optimized computed value)
@@ -103,6 +298,8 @@ func init() {
 	defaultContext = &Context{
 		disposables: make([]func(), 0),
 		parent:      nil,
+		values:      make(map[ContextKey]interface{}),
+		children:    make([]*Context, 0),
 	}
 	activeContext = defaultContext
 }
@@ -110,9 +307,21 @@ func init() {
 // CreateRoot creates a new root context with isolated reactivity
 func CreateRoot(fn func()) func() {
 	parentContext := activeContext
+
+	// Create new context
 	newContext := &Context{
 		disposables: make([]func(), 0),
 		parent:      parentContext,
+		values:      make(map[ContextKey]interface{}),
+		children:    make([]*Context, 0),
+		disposed:    false,
+	}
+
+	// Add this context as a child of the parent
+	if parentContext != nil {
+		parentContext.mutex.Lock()
+		parentContext.children = append(parentContext.children, newContext)
+		parentContext.mutex.Unlock()
 	}
 
 	// Set the new context as active
@@ -126,13 +335,124 @@ func CreateRoot(fn func()) func() {
 	activeContext = contextStack[len(contextStack)-1]
 	contextStack = contextStack[:len(contextStack)-1]
 
-	// Return a dispose function
+	// Return a dispose function that cleans up the context and its children
 	return func() {
-		for _, dispose := range newContext.disposables {
+		disposeContext(newContext)
+	}
+}
+
+// disposeContext recursively disposes a context and all its children
+func disposeContext(ctx *Context) {
+	if ctx == nil || ctx.disposed {
+		return
+	}
+
+	ctx.mutex.Lock()
+	// Mark as disposed
+	ctx.disposed = true
+
+	// Copy children to avoid modification during iteration
+	children := make([]*Context, len(ctx.children))
+	copy(children, ctx.children)
+	ctx.mutex.Unlock()
+
+	// Dispose all children first
+	for _, child := range children {
+		disposeContext(child)
+	}
+
+	ctx.mutex.Lock()
+
+	// Clear children
+	ctx.children = nil
+
+	// Run all disposables in reverse order (LIFO)
+	for i := len(ctx.disposables) - 1; i >= 0; i-- {
+		if dispose := ctx.disposables[i]; dispose != nil {
 			dispose()
 		}
-		newContext.disposables = nil
 	}
+
+	// Clear disposables
+	ctx.disposables = nil
+
+	// Remove from parent's children list
+	if parent := ctx.parent; parent != nil {
+		parent.mutex.Lock()
+		for i, child := range parent.children {
+			if child == ctx {
+				parent.children = append(parent.children[:i], parent.children[i+1:]...)
+				break
+			}
+		}
+		parent.mutex.Unlock()
+	}
+
+	// Clear values
+	ctx.values = nil
+
+	ctx.mutex.Unlock()
+}
+
+// ProvideContext sets a value in the current context
+func ProvideContext(key ContextKey, value interface{}) {
+	if activeContext == nil {
+		return
+	}
+
+	// Get a local reference to the active context to avoid race conditions
+	// if the active context changes while we're working with it
+	ctx := activeContext
+
+	ctx.mutex.Lock()
+	defer ctx.mutex.Unlock()
+
+	// Check again that the context is still valid
+	if ctx.disposed {
+		return
+	}
+
+	// Now it's safe to modify values
+	ctx.values[key] = value
+}
+
+// UseContext retrieves a value from the context chain
+func UseContext(key ContextKey) (interface{}, bool) {
+	// Start with the active context
+	ctx := activeContext
+
+	for ctx != nil {
+		ctx.mutex.RLock()
+
+		// Check if context is disposed
+		if ctx.disposed {
+			ctx.mutex.RUnlock()
+			return nil, false
+		}
+
+		// Look for the value
+		if value, exists := ctx.values[key]; exists {
+			ctx.mutex.RUnlock()
+			return value, true
+		}
+
+		// Move to parent, being careful to avoid race conditions
+		parent := ctx.parent
+		ctx.mutex.RUnlock()
+
+		// Move to the parent context
+		ctx = parent
+	}
+
+	return nil, false
+}
+
+// MustUseContext retrieves a value from context or panics if it doesn't exist
+func MustUseContext(key ContextKey) interface{} {
+	if value, exists := UseContext(key); exists {
+		return value
+	}
+	panic("Required context value not found: " + string(key))
 }
 
 // NewSignal creates a new signal with the provided initial value
@@ -153,6 +473,18 @@ func NewSignal[T any](initialValue T) *Signal[T] {
 	}
 
 	return s
+}
+
+// CreateSignal creates a signal and registers it with the current context
+// Returns the signal and a setter function for more idiomatic usage
+func CreateSignal[T any](initialValue T) (*Signal[T], func(T)) {
+	signal := NewSignal(initialValue)
+
+	setter := func(value T) {
+		signal.Set(value)
+	}
+
+	return signal, setter
 }
 
 // SetEqualityFn sets a custom equality function for the signal
@@ -344,6 +676,30 @@ func (s *Signal[T]) Peek() T {
 	return s.GetUntracked()
 }
 
+// GetSignalFromContext gets a signal by key, creating it if it doesn't exist
+// Great for accessing or creating signals in context
+func GetSignalFromContext[T any](key ContextKey, initializer func() T) *Signal[T] {
+	if value, exists := UseContext(key); exists {
+		// Check if the value is already a signal of the correct type
+		if signal, ok := value.(*Signal[T]); ok {
+			return signal
+		}
+
+		// If it's a raw value of the correct type, convert it to a signal
+		if rawValue, ok := value.(T); ok {
+			signal := NewSignal(rawValue)
+			ProvideContext(key, signal)
+			return signal
+		}
+	}
+
+	// Create a new signal with the initializer
+	initialValue := initializer()
+	signal := NewSignal(initialValue)
+	ProvideContext(key, signal)
+	return signal
+}
+
 // NewComputed creates a computed signal derived from other signals
 func NewComputed[T any](compute func() T) *Computed[T] {
 	// Create a type-specific equality function that uses reflect.DeepEqual internally
@@ -375,6 +731,27 @@ func NewComputed[T any](compute func() T) *Computed[T] {
 	}
 
 	return comp
+}
+
+// CreateComputed creates a computed value and registers it with current context
+// More idiomatic name aligning with other Create* functions
+func CreateComputed[T any](compute func() T) *Computed[T] {
+	return NewComputed(compute)
+}
+
+// GetComputedFromContext gets or creates a computed value from context
+func GetComputedFromContext[T any](key ContextKey, compute func() T) *Computed[T] {
+	if value, exists := UseContext(key); exists {
+		// Check if the value is already a computed of the correct type
+		if computed, ok := value.(*Computed[T]); ok {
+			return computed
+		}
+	}
+
+	// Create a new computed with the compute function
+	computed := CreateComputed(compute)
+	ProvideContext(key, computed)
+	return computed
 }
 
 func setupComputed[T any](comp *Computed[T]) {
@@ -626,6 +1003,8 @@ func (e *Effect) Dispose() {
 func OnCleanup(fn func()) {
 	if activeContext != nil {
 		activeContext.disposables = append(activeContext.disposables, fn)
+	} else {
+		onCleanupHooks = append(onCleanupHooks, fn)
 	}
 }
 
