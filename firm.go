@@ -909,6 +909,26 @@ func CreateMemo[T any](compute func() T, equals func(T, T) bool) *Memo[T] {
 	return memo
 }
 
+// Get returns the memoized value and tracks it as a dependency
+func (m *Memo[T]) Get() T {
+	return m.computed.Get()
+}
+
+// GetUntracked returns the value without tracking
+func (m *Memo[T]) GetUntracked() T {
+	return m.computed.GetUntracked()
+}
+
+// Peek gets the value without creating a dependency
+func (m *Memo[T]) Peek() T {
+	return m.computed.Peek()
+}
+
+// ForceComputation forces a recomputation
+func (m *Memo[T]) ForceComputation() {
+	m.computed.ForceComputation()
+}
+
 // Subscribe adds a listener to the memo value
 func (m *Memo[T]) Subscribe(listener func(T)) func() {
 	return m.computed.signal.Subscribe(listener)
