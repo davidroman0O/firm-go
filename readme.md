@@ -2,6 +2,8 @@
 
 A comprehensive library that brings Solid.js-style reactivity to Go, featuring signals, computed values, effects, resources, and stores.
 
+> WORK IN PROGRESS: fr fr i'm just checking the concept and ideas for now
+
 ## Overview
 
 Firm-Go is a Go library that implements a reactive programming model inspired by Solid.js. It provides primitives for creating and managing reactive state in Go applications in an idiomatic way.
