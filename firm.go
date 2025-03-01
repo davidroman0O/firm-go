@@ -210,8 +210,8 @@ func WithContext(fn func()) {
 
 // Memo represents a memoized value (optimized computed value)
 type Memo[T any] struct {
-	Computed[T]
-	equals func(T, T) bool
+	computed *Computed[T]
+	equals   func(T, T) bool
 }
 
 // Resource represents an async resource with loading/error states
@@ -876,33 +876,25 @@ func CreateMemo[T any](compute func() T, equals func(T, T) bool) *Memo[T] {
 	// First compute the initial value
 	initialValue := compute()
 
-	// Create a signal with the initial value
-	signal := Signal[T]{
-		value:      initialValue,
-		listeners:  make([]func(T), 0),
-		equalityFn: equals,
-		context:    activeContext,
-	}
+	// Create a signal with the initial value and custom equality function
+	signal := NewSignal(initialValue)
+	signal.SetEqualityFn(equals)
 
-	// Now create the computed with this pre-set signal
-	computed := &Computed[T]{
-		signal:  signal,
-		compute: compute,
-		deps:    make([]any, 0),
-		context: activeContext,
-		isStale: false, // Not stale since we just computed the value
-	}
+	// Create a computed that will track dependencies
+	computed := NewComputed(compute)
 
-	// Create the memo with the computed
-	memo := &Memo[T]{
-		Computed: *computed,
-		equals:   equals,
-	}
-
-	// Run a Get operation to establish dependencies
+	// Set up initial tracking
 	prevObserver := currentObserver
 	currentObserver = computed
+	_ = compute() // Run compute to establish dependencies
 	currentObserver = prevObserver
+	computed.isStale = false // Mark as not stale after initial computation
+
+	// Create the memo with a pointer to the computed
+	memo := &Memo[T]{
+		computed: computed, // Use pointer assignment, no mutex copying
+		equals:   equals,
+	}
 
 	// Register with context if needed
 	if activeContext != nil {
@@ -919,7 +911,7 @@ func CreateMemo[T any](compute func() T, equals func(T, T) bool) *Memo[T] {
 
 // Subscribe adds a listener to the memo value
 func (m *Memo[T]) Subscribe(listener func(T)) func() {
-	return m.Computed.signal.Subscribe(listener)
+	return m.computed.signal.Subscribe(listener)
 }
 
 // CreateEffect creates a new effect that runs when its dependencies change
