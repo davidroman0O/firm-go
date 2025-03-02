@@ -2,7 +2,7 @@
 
 <div align="center">
   <h3>Fine-grained Reactive State Management for Go</h3>
-  <p>A thread-safe, Solid.js-inspired reactive library for Go applications</p>
+  <p>A Solid.js-inspired reactive library for Go applications</p>
 
   ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
   ![Go Version](https://img.shields.io/badge/Go-1.18+-00ADD8.svg)
@@ -37,7 +37,6 @@
 ### Key Features
 
 - **✅ Fine-grained reactivity**: Updates propagate efficiently through a dependency graph
-- **✅ Thread-safe**: All operations are protected by mutexes for concurrent Go applications
 - **✅ Type-safe**: Built with Go generics for compile-time type checking
 - **✅ Automatic cleanup**: Resources are automatically cleaned up when no longer needed
 - **✅ Batched updates**: Efficiently group related state changes
