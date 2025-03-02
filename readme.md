@@ -9,6 +9,8 @@
   ![Status](https://img.shields.io/badge/Status-Beta-yellow)
 </div>
 
+> Work in progress: i'm almost satisfied with it
+
 ## 📚 Table of Contents
 
 - [Introduction](#introduction)
