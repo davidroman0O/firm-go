@@ -9,8 +9,6 @@
   ![Status](https://img.shields.io/badge/Status-Beta-yellow)
 </div>
 
-> Work in progress: i'm almost satisfied with it
-
 ## 📚 Table of Contents
 
 - [Introduction](#introduction)
@@ -22,6 +20,7 @@
   - [Contexts](#contexts)
   - [Resources](#resources)
   - [Batching](#batching)
+  - [Async Operations](#async-operations)
   - [Polling](#polling)
 - [Usage Examples](#usage-examples)
 - [Concurrency & Safety](#concurrency--safety)
@@ -40,7 +39,7 @@
 - **✅ Type-safe**: Built with Go generics for compile-time type checking
 - **✅ Automatic cleanup**: Resources are automatically cleaned up when no longer needed
 - **✅ Batched updates**: Efficiently group related state changes
-- **✅ Async support**: First-class support for asynchronous operations with Resources
+- **✅ Async support**: First-class support for asynchronous operations with WaitGroups
 - **✅ Reactive primitives**: Signals, Effects, Computed, Context, Resources and more
 
 ## Installation
@@ -53,10 +52,10 @@ go get github.com/davidroman0O/firm-go
 
 ### Owner and Root
 
-Firm-Go uses the concept of an "Owner" to manage the lifecycle of reactive primitives. The `Root` function creates a new owner:
+Firm-Go uses the concept of an "Owner" to manage the lifecycle of reactive primitives. The `Root` function creates a new owner and provides a way to safely wait for async operations:
 
 ```go
-cleanup := firm.Root(func(owner *firm.Owner) firm.CleanUp {
+cleanup, wait := firm.Root(func(owner *firm.Owner) firm.CleanUp {
     // Create signals, effects, etc. owned by this owner
     
     // Optional cleanup to run when root is disposed
@@ -64,6 +63,9 @@ cleanup := firm.Root(func(owner *firm.Owner) firm.CleanUp {
         fmt.Println("Root disposed")
     }
 })
+
+// Wait for all async operations to complete
+wait()
 
 // Later, clean up all resources
 defer cleanup()
@@ -129,24 +131,6 @@ doubled := firm.Memo(owner, func() int {
 
 // Read the computed value
 fmt.Println("Doubled:", doubled.Get())
-
-// A more complex example with explicit dependencies
-count := firm.Signal(owner, 5)
-multiplier := firm.Signal(owner, 2)
-
-// This memo explicitly lists its dependencies
-product := firm.Memo(owner, func() int {
-    return count.Get() * multiplier.Get()
-}, []firm.Reactive{count, multiplier})  // Explicitly list dependencies
-
-firm.Effect(owner, func() firm.CleanUp {
-    fmt.Printf("Product is now: %d\n", product.Get())
-    return nil
-}, nil)
-
-// When either signal changes, the memo updates
-count.Set(10)      // Logs: "Product is now: 20"
-multiplier.Set(3)  // Logs: "Product is now: 30"
 ```
 
 ### Contexts
@@ -171,14 +155,6 @@ themeContext.Set("dark")
 // Conditional rendering based on context
 themeContext.Match(owner, "dark", func(childOwner *firm.Owner) firm.CleanUp {
     // This runs only when theme is "dark"
-    return nil
-})
-
-// Conditional with custom matcher
-themeContext.When(owner, func(theme string) bool {
-    return theme == "light" || theme == "system"
-}, func(childOwner *firm.Owner) firm.CleanUp {
-    // This runs when theme is "light" or "system"
     return nil
 })
 ```
@@ -210,15 +186,6 @@ firm.Effect(owner, func() firm.CleanUp {
 
 // Refresh data
 userResource.Refetch()
-
-// Run function when data loads
-userResource.OnLoad(func(data User, err error) {
-    if err != nil {
-        fmt.Println("Failed to load:", err)
-    } else {
-        fmt.Println("User loaded:", data.Name)
-    }
-})
 ```
 
 ### Batching
@@ -233,6 +200,33 @@ firm.Batch(owner, func() {
     age.Set(30)
     // Effects will only run once after the batch completes
 })
+```
+
+### Async Operations
+
+Firm-Go provides a robust way to track and wait for asynchronous operations:
+
+```go
+cleanup, wait := firm.Root(func(owner *firm.Owner) firm.CleanUp {
+    // Track a pending operation
+    owner.TrackPendingOp()
+    
+    go func() {
+        // Do some async work
+        time.Sleep(500 * time.Millisecond)
+        
+        // Signal completion
+        owner.CompletePendingOp()
+    }()
+    
+    return nil
+})
+
+// Wait for all async operations to complete
+wait()
+
+// Clean up
+cleanup()
 ```
 
 ### Polling
@@ -254,7 +248,6 @@ firm.Effect(owner, func() firm.CleanUp {
 // Control the polling
 timePolling.Pause()  // Stop polling
 timePolling.Resume() // Resume polling
-timePolling.SetInterval(time.Minute) // Change interval
 ```
 
 ## Usage Examples
@@ -262,7 +255,7 @@ timePolling.SetInterval(time.Minute) // Change interval
 ### Simple Counter
 
 ```go
-cleanup := firm.Root(func(owner *firm.Owner) firm.CleanUp {
+cleanup, wait := firm.Root(func(owner *firm.Owner) firm.CleanUp {
     count := firm.Signal(owner, 0)
     doubled := firm.Memo(owner, func() int {
         return count.Get() * 2
@@ -279,13 +272,15 @@ cleanup := firm.Root(func(owner *firm.Owner) firm.CleanUp {
     
     return nil
 })
+
+wait()
 defer cleanup()
 ```
 
 ### Data Fetching with Resources
 
 ```go
-cleanup := firm.Root(func(owner *firm.Owner) firm.CleanUp {
+cleanup, wait := firm.Root(func(owner *firm.Owner) firm.CleanUp {
     userId := firm.Signal(owner, 1)
     
     userResource := firm.Resource(owner, func() (User, error) {
@@ -310,63 +305,77 @@ cleanup := firm.Root(func(owner *firm.Owner) firm.CleanUp {
     
     return nil
 })
+
+// Wait for all async operations (including fetches)
+wait()
 defer cleanup()
 ```
 
-### Theme Context Example
+### Debounced Search
 
 ```go
-cleanup := firm.Root(func(owner *firm.Owner) firm.CleanUp {
-    theme := firm.NewContext(owner, "light")
+cleanup, wait := firm.Root(func(owner *firm.Owner) firm.CleanUp {
+    search := firm.Signal(owner, "")
     
-    // Create UI with theme context
-    createUI := func(childOwner *firm.Owner) firm.CleanUp {
-        firm.Effect(childOwner, func() firm.CleanUp {
-            currentTheme := theme.Use()
-            fmt.Println("Rendering UI with theme:", currentTheme)
-            return nil
-        }, nil)
-        
+    // Debounced search query - updates 300ms after the source
+    debouncedSearch := firm.Defer(owner, search, 300)
+    
+    firm.Effect(owner, func() firm.CleanUp {
+        // Only runs when the debounced value changes
+        query := debouncedSearch.Get()
+        if query != "" {
+            fmt.Println("Searching for:", query)
+            // performSearch(query)
+        }
         return nil
-    }
+    }, nil)
     
-    // Create UI initially
-    createUI(owner)
-    
-    // Change theme later
-    theme.Set("dark")
+    // These rapid updates only result in one search
+    search.Set("a")
+    search.Set("ap")
+    search.Set("app")
+    search.Set("appl")
+    search.Set("apple")
     
     return nil
 })
+
+// Wait for debounced operations to complete
+wait()
 defer cleanup()
 ```
 
 ## Concurrency & Safety
 
-Firm-Go is designed for concurrent Go applications. All operations are protected by mutexes:
+Firm-Go is designed for concurrent Go applications with safety built-in:
 
 ```go
-cleanup := firm.Root(func(owner *firm.Owner) firm.CleanUp {
+cleanup, wait := firm.Root(func(owner *firm.Owner) firm.CleanUp {
     count := firm.Signal(owner, 0)
     
     // Launch multiple goroutines updating the signal
-    var wg sync.WaitGroup
     for i := 0; i < 10; i++ {
-        wg.Add(1)
-        go func() {
-            defer wg.Done()
+        owner.TrackPendingOp() // Track each goroutine
+        
+        go func(idx int) {
+            defer owner.CompletePendingOp() // Signal completion
+            
             // Atomic update of signal
             count.Update(func(v int) int {
                 return v + 1
             })
-        }()
+            
+            fmt.Printf("Goroutine %d updated count\n", idx)
+        }(i)
     }
     
-    wg.Wait()
-    fmt.Println("Final count:", count.Get()) // Should be 10
-    
-    return nil
+    return func() {
+        fmt.Println("Final count:", count.Get()) // Should be 10
+    }
 })
+
+// Wait for all goroutines to complete
+wait()
 defer cleanup()
 ```
 
@@ -377,7 +386,7 @@ defer cleanup()
 Create signals that derive from others with two-way binding:
 
 ```go
-cleanup := firm.Root(func(owner *firm.Owner) firm.CleanUp {
+cleanup, wait := firm.Root(func(owner *firm.Owner) firm.CleanUp {
     user := firm.Signal(owner, User{Name: "John", Age: 30})
     
     // Create a derived signal for the name field
@@ -406,6 +415,8 @@ cleanup := firm.Root(func(owner *firm.Owner) firm.CleanUp {
     
     return nil
 })
+
+wait()
 defer cleanup()
 ```
 
@@ -426,39 +437,6 @@ firm.Effect(owner, func() firm.CleanUp {
     fmt.Printf("Count: %d, Config: %v\n", count, config)
     return nil
 }, nil)
-```
-
-### Defer
-
-Create signals with delayed updates:
-
-```go
-cleanup := firm.Root(func(owner *firm.Owner) firm.CleanUp {
-    search := firm.Signal(owner, "")
-    
-    // Debounced search query - updates 300ms after the source
-    debouncedSearch := firm.Defer(owner, search, 300)
-    
-    firm.Effect(owner, func() firm.CleanUp {
-        // Only runs when the debounced value changes
-        query := debouncedSearch.Get()
-        if query != "" {
-            fmt.Println("Searching for:", query)
-            // performSearch(query)
-        }
-        return nil
-    }, nil)
-    
-    // These rapid updates only result in one search
-    search.Set("a")
-    search.Set("ap")
-    search.Set("app")
-    search.Set("appl")
-    search.Set("apple")
-    
-    return nil
-})
-defer cleanup()
 ```
 
 ## API Reference
@@ -486,21 +464,6 @@ Effect(owner, fn func() CleanUp, deps []Reactive)
 Memo[T](owner, compute func() T, deps []Reactive) -> *signalImpl[T]
 ```
 
-### Computed
-
-```go
-NewComputed[T](owner, compute func() T) -> *Computed[T]
-  Methods:
-    Get() -> T                     // Get the computed value
-    Recompute() -> bool            // Force recomputation
-```
-
-### Batch
-
-```go
-Batch(owner, fn func())
-```
-
 ### Context
 
 ```go
@@ -524,53 +487,66 @@ Resource[T](owner, fetcher func() (T, error)) -> *resourceImpl[T]
     OnLoad(fn func(T, error))      // Run when load completes
 ```
 
-### Polling
+### Owner
 
 ```go
-NewPolling[T](owner, compute func() T, interval) -> *Polling[T]
-  Methods:
-    Get() -> T                     // Get current value
-    SetInterval(interval)          // Change polling interval
-    Pause()                        // Pause polling
-    Resume()                       // Resume polling
+Root(fn func(owner *Owner) CleanUp) -> (cleanup CleanUp, wait func())
+
+Owner Methods:
+  TrackPendingOp()                 // Track an async operation
+  CompletePendingOp()              // Signal completion of an async operation
+  WaitForPending()                 // Wait for all tracked operations to complete
 ```
 
 ## Best Practices
 
-### Memory Management
+### Wait for Async Operations
 
-Always call cleanup functions to prevent memory leaks:
+Always use the `wait()` function to ensure all async operations complete:
 
 ```go
-cleanup := firm.Root(func(owner *firm.Owner) firm.CleanUp {
-    // Your reactive code
+cleanup, wait := firm.Root(func(owner *firm.Owner) firm.CleanUp {
+    // Your reactive code with async operations
     return nil
 })
-defer cleanup() // Important!
+
+// Wait for all async operations to complete
+wait()
+
+// Then clean up
+defer cleanup()
 ```
 
-### Batch Updates for Performance
+### Balance Tracking and Completion
 
-Use batching for multiple related updates:
+For every call to `TrackPendingOp()`, ensure there's a matching `CompletePendingOp()`:
 
 ```go
-firm.Batch(owner, func() {
-    firstName.Set("John")
-    lastName.Set("Doe")
-    email.Set("john.doe@example.com")
-})
+owner.TrackPendingOp()
+
+go func() {
+    defer owner.CompletePendingOp() // Always call this, even on error paths
+    
+    // Your async code
+}()
 ```
 
-### Minimize Dependency Tracking
+### Use Mutexes for Shared Data
 
-Use `Peek()` when you don't need reactivity:
+When using resources or sharing state across goroutines, use mutexes:
 
 ```go
-// This creates a dependency - effect will rerun when configSignal changes
-config := configSignal.Get()
+var mu sync.Mutex
+count := 0
 
-// This doesn't create a dependency
-config := configSignal.Peek()
+owner.TrackPendingOp()
+go func() {
+    defer owner.CompletePendingOp()
+    
+    mu.Lock()
+    count++
+    mu.Unlock()
+}()
 ```
 
 ### Clean Up Resources
