@@ -3,970 +3,1102 @@ package firm
 import (
 	"fmt"
 	"reflect"
-	"sync"
+	"runtime"
+	"time"
+
+	"github.com/sasha-s/go-deadlock"
 )
 
-// Context represents a reactive execution context that can be used to
-// track and manage dependencies, similar to Solid.js createRoot
-type Context struct {
-	disposables []func()
-	parent      *Context
-}
-
-// Memo represents a memoized value (optimized computed value)
-type Memo[T any] struct {
-	Computed[T]
-	equals func(T, T) bool
-}
-
-// Resource represents an async resource with loading/error states
-type Resource[T any] struct {
-	signal   Signal[ResourceState[T]]
-	fetcher  func() (T, error)
-	refetch  func()
-	disposed bool
-}
-
-// ResourceState represents the different states of a resource
-type ResourceState[T any] struct {
-	Loading bool
-	Error   error
-	Data    T
-}
-
-// Signal represents a reactive value that can be observed for changes
-type Signal[T any] struct {
-	value      T
-	listeners  []func(T)
-	mutex      sync.RWMutex
-	equalityFn func(T, T) bool
-	context    *Context
-}
-
-// Computed represents a derived value that depends on one or more signals
-type Computed[T any] struct {
-	signal    Signal[T]
-	compute   func() T
-	deps      []any // dependencies that this computed value listens to
-	cleanup   func()
-	isStale   bool
-	untracked bool
-	context   *Context
-}
-
-// ForceComputation forces a recomputation of the computed value
-func (c *Computed[T]) ForceComputation() {
-	c.isStale = true
-	c.Get()
-}
-
-// Effect represents a side effect that runs when its dependencies change
-type Effect struct {
-	execute  func()
-	deps     []any
-	cleanup  func()
-	disposed bool
-	context  *Context
-}
-
-// Store represents a reactive store (similar to Solid's createStore)
-type Store[T any] struct {
-	state      Signal[T]
-	middleware []func(path []string, value any, oldValue any) any
-}
-
-// Current tracking context for automatic dependency tracking
-var (
-	activeContext    *Context
-	currentObserver  any
-	runningEffects   []Effect
-	defaultContext   *Context
-	contextStack     []*Context
-	disposeOnUnmount []func()
-)
-
-// Batch functionality to batch updates
-var (
-	batchQueue     []func()
-	isBatchingFlag bool
-	batchMutex     sync.Mutex
-)
-
-// Lifecycle hooks
-var (
-	onMountHooks   []func()
-	onCleanupHooks []func()
-)
-
-// Initialize the default context
+// Initialize deadlock detection
 func init() {
-	defaultContext = &Context{
-		disposables: make([]func(), 0),
-		parent:      nil,
+	deadlock.Opts.DeadlockTimeout = time.Second * 2
+	deadlock.Opts.OnPotentialDeadlock = func() {
+		fmt.Println("Potential deadlock detected")
+		buf := make([]byte, 1<<16)
+		n := runtime.Stack(buf, true)
+		fmt.Printf("Stack trace:\n%s\n", string(buf[:n]))
 	}
-	activeContext = defaultContext
 }
 
-// CreateRoot creates a new root context with isolated reactivity
-func CreateRoot(fn func()) func() {
-	parentContext := activeContext
-	newContext := &Context{
-		disposables: make([]func(), 0),
-		parent:      parentContext,
+// CleanUp is a function that performs cleanup operations
+type CleanUp func()
+
+// Reactive is the interface implemented by all reactive objects
+type Reactive interface {
+	getNode() *node
+}
+
+// node represents a node in the dependency graph
+type node struct {
+	mu         deadlock.Mutex
+	dependents []*node
+	runEffect  func()
+	disposed   bool
+	owner      *Owner
+}
+
+func (n *node) addDependent(dep *node) {
+	if n.disposed {
+		return
 	}
 
-	// Set the new context as active
-	contextStack = append(contextStack, activeContext)
-	activeContext = newContext
+	n.mu.Lock()
+	defer n.mu.Unlock()
 
-	// Run the function in the new context
-	fn()
+	// Check if already exists
+	for _, existing := range n.dependents {
+		if existing == dep {
+			return
+		}
+	}
 
-	// Restore the previous context
-	activeContext = contextStack[len(contextStack)-1]
-	contextStack = contextStack[:len(contextStack)-1]
+	n.dependents = append(n.dependents, dep)
+}
 
-	// Return a dispose function
+func (n *node) removeDependent(dep *node) {
+	if n.disposed {
+		return
+	}
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	for i, existing := range n.dependents {
+		if existing == dep {
+			// Remove by swapping with last element
+			lastIdx := len(n.dependents) - 1
+			n.dependents[i] = n.dependents[lastIdx]
+			n.dependents = n.dependents[:lastIdx]
+			return
+		}
+	}
+}
+
+func (n *node) notify() {
+	if n.disposed {
+		return
+	}
+
+	// If batch mode is active, queue the notification
+	n.mu.Lock()
+	// Check if owner exists and get a local reference
+	owner := n.owner
+	n.mu.Unlock()
+
+	if owner != nil {
+		owner.mu.Lock()
+		batchActive := owner.batchActive
+		owner.mu.Unlock()
+
+		if batchActive {
+			owner.queueNotification(n)
+			return
+		}
+	}
+
+	// Otherwise process directly
+	processNodeNotify(n)
+}
+
+func (n *node) dispose() {
+	n.mu.Lock()
+	n.disposed = true
+	n.dependents = nil
+	n.runEffect = nil
+	n.mu.Unlock()
+}
+
+// Owner manages a reactive system
+type Owner struct {
+	mu            deadlock.Mutex
+	nodes         []*node
+	currentEffect *node
+	tracking      bool
+	batchActive   bool
+	batchQueue    []*node
+	batchSet      map[*node]struct{}
+	cleanups      []CleanUp
+}
+
+// NewOwner creates a new owner
+func NewOwner() *Owner {
+	return &Owner{
+		nodes:      make([]*node, 0),
+		batchSet:   make(map[*node]struct{}),
+		batchQueue: make([]*node, 0),
+		cleanups:   make([]CleanUp, 0),
+	}
+}
+
+// Root creates a reactive system
+func Root(fn func(r *Owner) CleanUp) CleanUp {
+	owner := NewOwner()
+	cleanup := fn(owner)
+
 	return func() {
-		for _, dispose := range newContext.disposables {
-			dispose()
+		// First run the user-provided cleanup
+		if cleanup != nil {
+			cleanup()
 		}
-		newContext.disposables = nil
+
+		// Then clean up the owner
+		owner.dispose()
 	}
 }
 
-// NewSignal creates a new signal with the provided initial value
-func NewSignal[T any](initialValue T) *Signal[T] {
-	s := &Signal[T]{
-		value:     initialValue,
-		listeners: make([]func(T), 0),
-		equalityFn: func(a, b T) bool {
-			return reflect.DeepEqual(a, b)
-		},
-		context: activeContext,
+func createNode(owner *Owner) *node {
+	owner.mu.Lock()
+	defer owner.mu.Unlock()
+
+	n := &node{
+		dependents: make([]*node, 0),
+		owner:      owner,
 	}
 
-	if activeContext != nil {
-		activeContext.disposables = append(activeContext.disposables, func() {
-			s.listeners = nil
-		})
+	owner.nodes = append(owner.nodes, n)
+	return n
+}
+
+func (owner *Owner) queueNotification(n *node) {
+	owner.mu.Lock()
+	defer owner.mu.Unlock()
+
+	// Only add if not already in queue
+	if _, exists := owner.batchSet[n]; !exists {
+		owner.batchQueue = append(owner.batchQueue, n)
+		owner.batchSet[n] = struct{}{}
 	}
-
-	return s
 }
 
-// SetEqualityFn sets a custom equality function for the signal
-func (s *Signal[T]) SetEqualityFn(fn func(T, T) bool) {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-	s.equalityFn = fn
-}
+func (owner *Owner) processBatchQueue() {
+	owner.mu.Lock()
+	queue := make([]*node, len(owner.batchQueue))
+	copy(queue, owner.batchQueue)
+	owner.batchQueue = owner.batchQueue[:0]
+	owner.batchSet = make(map[*node]struct{})
+	owner.mu.Unlock()
 
-// Get returns the current value of the signal and tracks it as a dependency
-func (s *Signal[T]) Get() T {
-	s.mutex.RLock()
-	value := s.value
-	s.mutex.RUnlock()
-
-	// Track this signal as a dependency of the current observer
-	if currentObserver != nil {
-		switch observer := currentObserver.(type) {
-		case *Computed[T]:
-			// Add a subscription to this signal
-			unsubscribe := s.Subscribe(func(newValue T) {
-				if observer.isStale {
-					return
-				}
-				observer.isStale = true
-
-				// If we're not within a batch, recompute immediately
-				if !isBatching() {
-					prevObserver := currentObserver
-					currentObserver = observer
-					observer.signal.Set(observer.compute())
-					currentObserver = prevObserver
-					observer.isStale = false
-				}
-			})
-
-			// Store the unsubscribe function to clean up later
-			if observer.cleanup == nil {
-				observer.cleanup = unsubscribe
-			} else {
-				oldCleanup := observer.cleanup
-				observer.cleanup = func() {
-					oldCleanup()
-					unsubscribe()
-				}
-			}
-		case *Effect:
-			// Add a subscription to this signal
-			unsubscribe := s.Subscribe(func(newValue T) {
-				if !observer.disposed {
-					execute(observer)
-				}
-			})
-
-			// Store the unsubscribe function to clean up later
-			if observer.cleanup == nil {
-				observer.cleanup = unsubscribe
-			} else {
-				oldCleanup := observer.cleanup
-				observer.cleanup = func() {
-					oldCleanup()
-					unsubscribe()
-				}
-			}
-		default:
-			// Handle other types of observers
-			// This is mainly to support generic type parameters
-			switch any(observer).(type) {
-			case *Computed[any]:
-				comp := any(observer).(*Computed[any])
-				unsubscribe := s.Subscribe(func(newValue T) {
-					if comp.isStale {
-						return
-					}
-					comp.isStale = true
-
-					// If we're not within a batch, recompute immediately
-					if !isBatching() {
-						prevObserver := currentObserver
-						currentObserver = comp
-						comp.signal.Set(comp.compute())
-						currentObserver = prevObserver
-						comp.isStale = false
-					}
-				})
-
-				if comp.cleanup == nil {
-					comp.cleanup = unsubscribe
-				} else {
-					oldCleanup := comp.cleanup
-					comp.cleanup = func() {
-						oldCleanup()
-						unsubscribe()
-					}
-				}
-			case *Effect:
-				eff := any(observer).(*Effect)
-				unsubscribe := s.Subscribe(func(newValue T) {
-					if !eff.disposed {
-						execute(eff)
-					}
-				})
-
-				if eff.cleanup == nil {
-					eff.cleanup = unsubscribe
-				} else {
-					oldCleanup := eff.cleanup
-					eff.cleanup = func() {
-						oldCleanup()
-						unsubscribe()
-					}
-				}
-			}
+	for _, n := range queue {
+		if !n.disposed {
+			n.notify()
 		}
 	}
-
-	return value
 }
 
-// GetUntracked returns the current value without tracking it as a dependency
-func (s *Signal[T]) GetUntracked() T {
-	s.mutex.RLock()
-	defer s.mutex.RUnlock()
+func (owner *Owner) trackDependency(dep *node) {
+	owner.mu.Lock()
+	defer owner.mu.Unlock()
+
+	if !owner.tracking || owner.currentEffect == nil || dep == nil {
+		return
+	}
+
+	dep.addDependent(owner.currentEffect)
+}
+
+func (owner *Owner) beginTracking(effect *node) {
+	owner.mu.Lock()
+	defer owner.mu.Unlock()
+
+	owner.currentEffect = effect
+	owner.tracking = true
+}
+
+func (owner *Owner) endTracking() {
+	owner.mu.Lock()
+	defer owner.mu.Unlock()
+
+	owner.currentEffect = nil
+	owner.tracking = false
+}
+
+// dispose runs all cleanup functions for this owner
+func (o *Owner) dispose() {
+	o.mu.Lock()
+	// Make a local copy of cleanups
+	cleanups := make([]CleanUp, len(o.cleanups))
+	copy(cleanups, o.cleanups)
+	// Clear cleanups first to prevent re-running
+	o.cleanups = nil
+	o.mu.Unlock()
+
+	// Run cleanups in reverse order (LIFO)
+	for i := len(cleanups) - 1; i >= 0; i-- {
+		if cleanups[i] != nil {
+			cleanups[i]()
+		}
+	}
+}
+
+// signalImpl holds a reactive value (private implementation)
+type signalImpl[T any] struct {
+	value T
+	owner *Owner
+	node  *node
+	mu    deadlock.RWMutex
+}
+
+// Signal creates a reactive value
+func Signal[T any](owner *Owner, initialValue T) *signalImpl[T] {
+	return &signalImpl[T]{
+		value: initialValue,
+		owner: owner,
+		node:  createNode(owner),
+	}
+}
+
+func (s *signalImpl[T]) Get() T {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	// Track as dependency if in tracking mode
+	if s.owner != nil {
+		s.owner.trackDependency(s.node)
+	}
+
 	return s.value
 }
 
-// Set updates the signal's value and notifies listeners if the value changed
-func (s *Signal[T]) Set(newValue T) {
-	var valueChanged bool
-	var listeners []func(T)
+func (s *signalImpl[T]) Set(value T) {
+	s.mu.Lock()
 
-	s.mutex.Lock()
-	// Compare old and new values using the equality function
-	oldValue := s.value
-	valueChanged = !s.equalityFn(oldValue, newValue)
-
-	if valueChanged {
-		s.value = newValue
-		// Make a copy of listeners to avoid holding the lock during callbacks
-		listeners = make([]func(T), len(s.listeners))
-		copy(listeners, s.listeners)
+	// Skip update if value is equal
+	if reflect.DeepEqual(s.value, value) {
+		s.mu.Unlock()
+		return
 	}
-	s.mutex.Unlock()
 
-	// Notify listeners outside the lock
-	if valueChanged {
-		if isBatching() {
-			batchUpdate(func() {
-				for _, listener := range listeners {
-					listener(newValue)
-				}
+	s.value = value
+	s.mu.Unlock()
+
+	// Notify dependents
+	s.node.notify()
+}
+
+func (s *signalImpl[T]) Peek() T {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.value
+}
+
+func (s *signalImpl[T]) Update(fn func(T) T) {
+	s.mu.Lock()
+	oldValue := s.value
+	newValue := fn(oldValue)
+	s.value = newValue
+	changed := !reflect.DeepEqual(oldValue, newValue)
+	s.mu.Unlock()
+
+	// Only notify if the value actually changed
+	if changed {
+		// Use batch to handle concurrent notifications more reliably
+		if s.owner != nil {
+			Batch(s.owner, func() {
+				s.node.notify()
 			})
 		} else {
-			for _, listener := range listeners {
-				listener(newValue)
-			}
+			s.node.notify()
 		}
 	}
 }
 
-// Subscribe adds a listener to the signal
-func (s *Signal[T]) Subscribe(listener func(T)) func() {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
+func (s *signalImpl[T]) getNode() *node {
+	return s.node
+}
 
-	s.listeners = append(s.listeners, listener)
+// Effect creates a side effect that runs when dependencies change
+func Effect(owner *Owner, fn func() CleanUp, deps []Reactive) {
+	// Create effect node
+	effectNode := createNode(owner)
 
-	// Return a function to remove this listener
-	return func() {
-		s.mutex.Lock()
-		defer s.mutex.Unlock()
+	// Use mutex to protect access to cleanup and dependencies
+	var effectMu deadlock.Mutex
+	var cleanup CleanUp
 
-		for i, l := range s.listeners {
-			if fmt.Sprintf("%p", l) == fmt.Sprintf("%p", listener) {
-				s.listeners = append(s.listeners[:i], s.listeners[i+1:]...)
-				break
-			}
+	// Dependencies of this effect
+	dependencies := make([]*node, 0, len(deps))
+
+	// Set up the effect function
+	effectNode.runEffect = func() {
+		// Run cleanup from previous execution
+		effectMu.Lock()
+		if cleanup != nil {
+			localCleanup := cleanup // Make a local copy to run outside the lock
+			cleanup = nil
+			effectMu.Unlock()
+			localCleanup()
+		} else {
+			effectMu.Unlock()
 		}
-	}
-}
 
-// Update allows updating the signal based on its current value
-func (s *Signal[T]) Update(fn func(T) T) {
-	s.Set(fn(s.Get()))
-}
+		// Remove existing dependencies - need lock for this
+		effectMu.Lock()
+		depsToRemove := make([]*node, len(dependencies))
+		copy(depsToRemove, dependencies)
+		dependencies = dependencies[:0]
+		effectMu.Unlock()
 
-// Peek gets the signal's value without creating a dependency
-func (s *Signal[T]) Peek() T {
-	return s.GetUntracked()
-}
-
-// NewComputed creates a computed signal derived from other signals
-func NewComputed[T any](compute func() T) *Computed[T] {
-	// Create a type-specific equality function that uses reflect.DeepEqual internally
-	equalityFn := func(a, b T) bool {
-		return reflect.DeepEqual(a, b)
-	}
-
-	comp := &Computed[T]{
-		signal: Signal[T]{
-			value:      *new(T), // Initialize with zero value
-			listeners:  make([]func(T), 0),
-			equalityFn: equalityFn,
-			context:    activeContext,
-		},
-		compute: compute,
-		deps:    make([]any, 0),
-		context: activeContext,
-		isStale: true, // Start as stale to ensure initial computation
-	}
-
-	// Register with context if needed
-	if activeContext != nil {
-		activeContext.disposables = append(activeContext.disposables, func() {
-			if comp.cleanup != nil {
-				comp.cleanup()
-				comp.cleanup = nil
-			}
-		})
-	}
-
-	return comp
-}
-
-func setupComputed[T any](comp *Computed[T]) {
-	// Create a subscriber for each dependency
-	comp.cleanup = func() {
-		for _, dep := range comp.deps {
-			switch d := dep.(type) {
-			case *Signal[any]:
-				d.Subscribe(func(any) {
-					if !comp.isStale {
-						comp.isStale = true
-
-						// If we're not within a batch, recompute immediately
-						if !isBatching() {
-							prevObserver := currentObserver
-							currentObserver = comp
-							comp.signal.Set(comp.compute())
-							currentObserver = prevObserver
-							comp.isStale = false
-						}
-					}
-				})
-			}
+		for _, dep := range depsToRemove {
+			dep.removeDependent(effectNode)
 		}
-	}
 
-	comp.cleanup()
-}
+		// Track new dependencies if none specified
+		var newCleanup CleanUp
+		if len(deps) == 0 {
+			owner.beginTracking(effectNode)
+			newCleanup = fn()
+			owner.endTracking()
+		} else {
+			// Otherwise use explicit dependencies
+			newCleanup = fn()
 
-// Get returns the computed value and tracks it as a dependency
-func (c *Computed[T]) Get() T {
-	// Re-compute if stale
-	if c.isStale {
-		prevObserver := currentObserver
-		currentObserver = c
-		value := c.compute()
-		c.signal.Set(value)
-		currentObserver = prevObserver
-		c.isStale = false
-	}
-
-	// Track this computed as a dependency (if we're in a tracking context)
-	value := c.signal.value
-
-	if !c.untracked && currentObserver != nil {
-		switch observer := currentObserver.(type) {
-		case *Computed[T]:
-			// Add a subscription to this computed
-			unsubscribe := c.signal.Subscribe(func(newValue T) {
-				if observer.isStale {
-					return
-				}
-				observer.isStale = true
-
-				// If we're not within a batch, recompute immediately
-				if !isBatching() {
-					prevObserver := currentObserver
-					currentObserver = observer
-					observer.signal.Set(observer.compute())
-					currentObserver = prevObserver
-					observer.isStale = false
-				}
-			})
-
-			// Store the unsubscribe function to clean up later
-			if observer.cleanup == nil {
-				observer.cleanup = unsubscribe
-			} else {
-				oldCleanup := observer.cleanup
-				observer.cleanup = func() {
-					oldCleanup()
-					unsubscribe()
-				}
+			// Add dependencies - safely add to dependencies
+			effectMu.Lock()
+			for _, dep := range deps {
+				node := dep.getNode()
+				node.addDependent(effectNode)
+				dependencies = append(dependencies, node)
 			}
-		case *Effect:
-			// Add a subscription to this computed
-			unsubscribe := c.signal.Subscribe(func(newValue T) {
-				if !observer.disposed {
-					execute(observer)
-				}
-			})
-
-			// Store the unsubscribe function to clean up later
-			if observer.cleanup == nil {
-				observer.cleanup = unsubscribe
-			} else {
-				oldCleanup := observer.cleanup
-				observer.cleanup = func() {
-					oldCleanup()
-					unsubscribe()
-				}
-			}
+			effectMu.Unlock()
 		}
+
+		// Store new cleanup function with mutex protection
+		effectMu.Lock()
+		cleanup = newCleanup
+		effectMu.Unlock()
 	}
 
-	return value
-}
+	// Run initially
+	effectNode.runEffect()
 
-// GetUntracked returns the computed value without tracking
-func (c *Computed[T]) GetUntracked() T {
-	prev := c.untracked
-	c.untracked = true
-	value := c.Get()
-	c.untracked = prev
-	return value
-}
+	// Register cleanup with thread-safe access
+	owner.mu.Lock()
+	owner.cleanups = append(owner.cleanups, func() {
+		effectMu.Lock()
+		localCleanup := cleanup
+		cleanup = nil
 
-// Peek gets the computed value without creating a dependency
-func (c *Computed[T]) Peek() T {
-	return c.GetUntracked()
-}
+		// Get dependencies to remove under lock
+		depsToRemove := make([]*node, len(dependencies))
+		copy(depsToRemove, dependencies)
+		dependencies = nil
+		effectMu.Unlock()
 
-// CreateMemo creates a memoized value (optimized computed)
-func CreateMemo[T any](compute func() T, equals func(T, T) bool) *Memo[T] {
-	if equals == nil {
-		// Create a type-specific equality function that uses reflect.DeepEqual
-		equals = func(a, b T) bool {
-			return reflect.DeepEqual(a, b)
+		if localCleanup != nil {
+			localCleanup()
 		}
-	}
 
-	// First compute the initial value
-	initialValue := compute()
-
-	// Create a signal with the initial value
-	signal := Signal[T]{
-		value:      initialValue,
-		listeners:  make([]func(T), 0),
-		equalityFn: equals,
-		context:    activeContext,
-	}
-
-	// Now create the computed with this pre-set signal
-	computed := &Computed[T]{
-		signal:  signal,
-		compute: compute,
-		deps:    make([]any, 0),
-		context: activeContext,
-		isStale: false, // Not stale since we just computed the value
-	}
-
-	// Create the memo with the computed
-	memo := &Memo[T]{
-		Computed: *computed,
-		equals:   equals,
-	}
-
-	// Run a Get operation to establish dependencies
-	prevObserver := currentObserver
-	currentObserver = computed
-	currentObserver = prevObserver
-
-	// Register with context if needed
-	if activeContext != nil {
-		activeContext.disposables = append(activeContext.disposables, func() {
-			if computed.cleanup != nil {
-				computed.cleanup()
-				computed.cleanup = nil
-			}
-		})
-	}
-
-	return memo
-}
-
-// Subscribe adds a listener to the memo value
-func (m *Memo[T]) Subscribe(listener func(T)) func() {
-	return m.Computed.signal.Subscribe(listener)
-}
-
-// CreateEffect creates a new effect that runs when its dependencies change
-func CreateEffect(execute func()) *Effect {
-	effect := &Effect{
-		execute:  execute,
-		deps:     make([]any, 0),
-		disposed: false,
-		context:  activeContext,
-	}
-
-	// Run the effect once to capture dependencies
-	runningEffects = append(runningEffects, *effect)
-	prevObserver := currentObserver
-	currentObserver = effect
-	execute()
-	currentObserver = prevObserver
-	runningEffects = runningEffects[:len(runningEffects)-1]
-
-	if activeContext != nil {
-		activeContext.disposables = append(activeContext.disposables, func() {
-			effect.Dispose()
-		})
-	}
-
-	return effect
-}
-
-func setupEffect(effect *Effect) {
-	// Create a subscriber for each dependency
-	for _, dep := range effect.deps {
-		switch d := dep.(type) {
-		case *Signal[any]:
-			d.Subscribe(func(any) {
-				if !effect.disposed {
-					execute(effect)
-				}
-			})
-		case *Computed[any]:
-			d.signal.Subscribe(func(any) {
-				if !effect.disposed {
-					execute(effect)
-				}
-			})
+		// Remove dependencies
+		for _, dep := range depsToRemove {
+			dep.removeDependent(effectNode)
 		}
-	}
+
+		effectNode.dispose()
+	})
+	owner.mu.Unlock()
 }
 
-func execute(effect *Effect) {
-	if effect.disposed {
-		return
-	}
+// Memo creates a computed value
+func Memo[T any](owner *Owner, compute func() T, deps []Reactive) *signalImpl[T] {
+	signal := Signal(owner, *new(T))
 
-	// Run cleanup if needed
-	if effect.cleanup != nil {
-		effect.cleanup()
-		effect.cleanup = nil
-	}
+	Effect(owner, func() CleanUp {
+		signal.Set(compute())
+		return func() {}
+	}, deps)
 
-	// Re-run the effect
-	prevObserver := currentObserver
-	currentObserver = effect
-	effect.execute()
-	currentObserver = prevObserver
+	// Initial computation
+	signal.Set(compute())
+
+	return signal
 }
 
-// Dispose cleans up the effect
-func (e *Effect) Dispose() {
-	if e.disposed {
-		return
-	}
+// Untrack prevents dependency tracking
+func Untrack[T any](owner *Owner, fn func() T) T {
+	owner.mu.Lock()
+	oldTracking := owner.tracking
+	oldEffect := owner.currentEffect
+	owner.tracking = false
+	owner.currentEffect = nil
+	owner.mu.Unlock()
 
-	e.disposed = true
-	if e.cleanup != nil {
-		e.cleanup()
-		e.cleanup = nil
-	}
-}
-
-// OnCleanup registers a cleanup function for the current context
-func OnCleanup(fn func()) {
-	if activeContext != nil {
-		activeContext.disposables = append(activeContext.disposables, fn)
-	}
-}
-
-// OnMount registers a function to run when a component mounts
-func OnMount(fn func()) {
-	onMountHooks = append(onMountHooks, fn)
-}
-
-// RunOnMountHooks runs all registered onMount hooks
-func RunOnMountHooks() {
-	for _, hook := range onMountHooks {
-		hook()
-	}
-	onMountHooks = []func(){}
-}
-
-// Untrack prevents dependency tracking within the provided function
-func Untrack[T any](fn func() T) T {
-	// Save the current observer
-	prevObserver := currentObserver
-	// Set current observer to nil to prevent tracking
-	currentObserver = nil
-	// Call the function with tracking disabled
 	result := fn()
-	// Restore the previous observer
-	currentObserver = prevObserver
+
+	owner.mu.Lock()
+	owner.tracking = oldTracking
+	owner.currentEffect = oldEffect
+	owner.mu.Unlock()
+
 	return result
 }
 
-// Batch executes the function with batched updates
-func Batch(fn func()) {
-	batchMutex.Lock()
-	wasBatching := isBatchingFlag
-	isBatchingFlag = true
-	batchMutex.Unlock()
+// Global mutex to synchronize batch operations
+var batchMutex deadlock.Mutex
 
-	// Execute the batch function
+// Batch runs multiple updates as a batch
+func Batch(owner *Owner, fn func()) {
+	// Save previous batch state
+	owner.mu.Lock()
+	oldBatch := owner.batchActive
+	owner.batchActive = true
+	owner.mu.Unlock()
+
+	// Run the batch function
 	fn()
 
-	// Only process updates at the outermost batch level
-	if !wasBatching {
-		batchMutex.Lock()
-		// Capture the current batch queue
-		updates := make([]func(), len(batchQueue))
-		copy(updates, batchQueue)
-		// Reset the batch state
-		batchQueue = nil
-		isBatchingFlag = false
-		batchMutex.Unlock()
+	// Restore previous batch state
+	owner.mu.Lock()
+	wasActive := owner.batchActive
+	owner.batchActive = oldBatch
 
-		// Execute all queued updates at once
-		for _, update := range updates {
-			update()
+	// If we're returning to non-batch mode, process queue
+	if wasActive && !oldBatch {
+		// Make a local copy of the queue
+		queue := make([]*node, len(owner.batchQueue))
+		copy(queue, owner.batchQueue)
+
+		// Clear the queue
+		owner.batchQueue = owner.batchQueue[:0]
+		owner.batchSet = make(map[*node]struct{})
+		owner.mu.Unlock()
+
+		// Process queue outside the lock
+		for _, n := range queue {
+			if n != nil && !n.disposed {
+				processNode(n)
+			}
+		}
+	} else {
+		owner.mu.Unlock()
+	}
+}
+
+// Helper to process nodes without locking issues
+func processNode(n *node) {
+	// Skip if node is disposed
+	if n.disposed {
+		return
+	}
+
+	// Get snapshot of dependents
+	n.mu.Lock()
+	deps := make([]*node, len(n.dependents))
+	copy(deps, n.dependents)
+	n.mu.Unlock()
+
+	// Set to track already processed effects
+	processed := make(map[*node]struct{})
+
+	// Process each dependent
+	for _, dep := range deps {
+		if dep == nil || dep.disposed || dep.runEffect == nil {
+			continue
+		}
+
+		if _, alreadyProcessed := processed[dep]; alreadyProcessed {
+			continue
+		}
+
+		processed[dep] = struct{}{}
+		dep.runEffect()
+	}
+}
+
+// Helper function to process node notifications
+func processNodeNotify(n *node) {
+	// Make a copy of dependents under lock and check disposed state
+	n.mu.Lock()
+	if n.disposed {
+		n.mu.Unlock()
+		return
+	}
+	deps := make([]*node, len(n.dependents))
+	copy(deps, n.dependents)
+	n.mu.Unlock()
+
+	// Process dependents, carefully checking their state
+	for _, dep := range deps {
+		if dep == nil {
+			continue
+		}
+
+		// Get runEffect function safely
+		dep.mu.Lock()
+		runEffect := dep.runEffect
+		isDisposed := dep.disposed
+		dep.mu.Unlock()
+
+		if runEffect != nil && !isDisposed {
+			runEffect()
 		}
 	}
 }
 
-// CreateResource creates an async resource with loading/error states
-func CreateResource[T any](fetcher func() (T, error)) *Resource[T] {
-	initialState := ResourceState[T]{
-		Loading: true,
-		Error:   nil,
-		Data:    *new(T),
+// Context provides value propagation through the reactive tree
+type Context[T any] struct {
+	value *signalImpl[T]
+	owner *Owner
+	node  *node
+}
+
+// NewContext creates a new context with a default value
+func NewContext[T any](owner *Owner, defaultValue T) *Context[T] {
+	context := &Context[T]{
+		value: Signal(owner, defaultValue),
+		owner: owner,
+		node:  createNode(owner),
 	}
 
-	resource := &Resource[T]{
-		signal:   *NewSignal(initialState),
-		fetcher:  fetcher,
-		disposed: false,
-	}
+	// Make the context's node reflect the value's node
+	Effect(owner, func() CleanUp {
+		// Get value to track dependency
+		context.value.Get()
+		context.node.notify()
+		return nil
+	}, []Reactive{context.value})
 
-	// Create the refetch function
-	resource.refetch = func() {
-		if resource.disposed {
-			return
+	return context
+}
+
+// Use retrieves the current context value
+func (c *Context[T]) Use() T {
+	// Track this context as a dependency
+	if c.owner != nil {
+		c.owner.trackDependency(c.node)
+	}
+	return c.value.Get()
+}
+
+// Set changes the context value
+func (c *Context[T]) Set(value T) {
+	c.value.Set(value)
+}
+
+// getNode implements the Reactive interface
+func (c *Context[T]) getNode() *node {
+	return c.node
+}
+
+// Match runs code only when context exactly matches a value
+func (c *Context[T]) Match(
+	owner *Owner,
+	value T,
+	fn func(childOwner *Owner) CleanUp,
+) CleanUp {
+	childOwner := NewOwner()
+
+	var childCleanup CleanUp
+	var isActive bool = false
+
+	// Effect that watches the context value
+	Effect(owner, func() CleanUp {
+		currentValue := c.Use()
+		matched := reflect.DeepEqual(currentValue, value)
+
+		// If match state changed
+		if matched != isActive {
+			// If now matched, create the child scope
+			if matched {
+				childCleanup = fn(childOwner)
+				isActive = true
+			} else if childCleanup != nil {
+				// If no longer matched, clean up the child scope
+				childCleanup()
+				childCleanup = nil
+				isActive = false
+			}
 		}
 
-		// Set loading state
-		resource.signal.Update(func(s ResourceState[T]) ResourceState[T] {
-			s.Loading = true
-			return s
-		})
+		return func() {
+			if childCleanup != nil {
+				childCleanup()
+				childCleanup = nil
+			}
+		}
+	}, []Reactive{c})
 
-		// Execute the fetcher
+	// Return a cleanup function
+	return func() {
+		if childCleanup != nil {
+			childCleanup()
+		}
+		childOwner.dispose()
+	}
+}
+
+// When runs the provided function only when the context value matches the condition
+func (c *Context[T]) When(
+	owner *Owner,
+	matcher func(T) bool,
+	fn func(childOwner *Owner) CleanUp,
+) CleanUp {
+	childOwner := NewOwner()
+
+	var childCleanup CleanUp
+	var isActive bool = false
+
+	// Effect that watches the context value
+	Effect(owner, func() CleanUp {
+		currentValue := c.Use()
+		matched := matcher(currentValue)
+
+		// If match state changed
+		if matched != isActive {
+			// If now matched, create the child scope
+			if matched {
+				childCleanup = fn(childOwner)
+				isActive = true
+			} else if childCleanup != nil {
+				// If no longer matched, clean up the child scope
+				childCleanup()
+				childCleanup = nil
+				isActive = false
+			}
+		}
+
+		return func() {
+			if childCleanup != nil {
+				childCleanup()
+				childCleanup = nil
+			}
+		}
+	}, []Reactive{c})
+
+	// Return a cleanup function
+	return func() {
+		if childCleanup != nil {
+			childCleanup()
+		}
+		childOwner.dispose()
+	}
+}
+
+// resourceImpl represents async data (private implementation)
+type resourceImpl[T any] struct {
+	owner   *Owner
+	loading *signalImpl[bool]
+	data    *signalImpl[T]
+	error   *signalImpl[error]
+	refetch func()
+	node    *node
+	mu      deadlock.Mutex
+}
+
+// Resource creates a resource with async fetcher
+func Resource[T any](
+	owner *Owner,
+	fetcher func() (T, error),
+) *resourceImpl[T] {
+	loading := Signal(owner, true)
+	data := Signal(owner, *new(T))
+	err := Signal(owner, error(nil))
+
+	// Node for the resource
+	resourceNode := createNode(owner)
+
+	// Use WaitGroup for synchronization
+	var fetchWg deadlock.WaitGroup
+	var fetchMu deadlock.Mutex
+	var active bool = true
+
+	resource := &resourceImpl[T]{
+		owner:   owner,
+		loading: loading,
+		data:    data,
+		error:   err,
+		node:    resourceNode,
+	}
+
+	// Create refetch function with better synchronization
+	resource.refetch = func() {
+		fetchMu.Lock()
+		if !active {
+			fetchMu.Unlock()
+			return
+		}
+		loading.Set(true)
+		fetchWg.Add(1)
+		fetchMu.Unlock()
+
 		go func() {
-			if resource.disposed {
+			defer fetchWg.Done()
+
+			result, fetchErr := fetcher()
+
+			fetchMu.Lock()
+			if !active {
+				fetchMu.Unlock()
 				return
 			}
 
-			data, err := fetcher()
-
-			// Update the resource with the result
-			resource.signal.Update(func(s ResourceState[T]) ResourceState[T] {
-				s.Loading = false
-				s.Error = err
-				if err == nil {
-					s.Data = data
+			Batch(owner, func() {
+				if fetchErr != nil {
+					err.Set(fetchErr)
+				} else {
+					data.Set(result)
 				}
-				return s
+				loading.Set(false)
+				resourceNode.notify()
 			})
+			fetchMu.Unlock()
 		}()
 	}
 
 	// Initial fetch
 	resource.refetch()
 
-	// Register with the current context
-	if activeContext != nil {
-		activeContext.disposables = append(activeContext.disposables, func() {
-			resource.disposed = true
-		})
-	}
+	// Register cleanup that waits for ongoing fetches
+	owner.mu.Lock()
+	owner.cleanups = append(owner.cleanups, func() {
+		fetchMu.Lock()
+		active = false
+		fetchMu.Unlock()
+
+		// Wait for any ongoing fetches to complete
+		fetchWg.Wait()
+	})
+	owner.mu.Unlock()
 
 	return resource
 }
 
-// Read returns the current state of the resource
-func (r *Resource[T]) Read() ResourceState[T] {
-	return r.signal.Get()
+func (r *resourceImpl[T]) Loading() bool {
+	r.owner.trackDependency(r.loading.node)
+	return r.loading.Get()
 }
 
-// Loading returns whether the resource is currently loading
-func (r *Resource[T]) Loading() bool {
-	return r.signal.Get().Loading
+func (r *resourceImpl[T]) Data() T {
+	r.owner.trackDependency(r.data.node)
+	return r.data.Get()
 }
 
-// Error returns any error that occurred during fetching
-func (r *Resource[T]) Error() error {
-	return r.signal.Get().Error
+func (r *resourceImpl[T]) Error() error {
+	r.owner.trackDependency(r.error.node)
+	return r.error.Get()
 }
 
-// Data returns the data from the resource
-func (r *Resource[T]) Data() T {
-	return r.signal.Get().Data
-}
-
-// Refetch triggers the resource to fetch again
-func (r *Resource[T]) Refetch() {
+func (r *resourceImpl[T]) Refetch() {
 	r.refetch()
 }
 
-// CreateStore creates a reactive store similar to Solid's createStore
-func CreateStore[T any](initialState T) *Store[T] {
-	return &Store[T]{
-		state:      *NewSignal(initialState),
-		middleware: make([]func(path []string, value any, oldValue any) any, 0),
-	}
-}
-
-// Get returns the current state of the store
-func (s *Store[T]) Get() T {
-	return s.state.Get()
-}
-
-// Set updates the entire store state
-func (s *Store[T]) Set(newState T) {
-	s.state.Set(newState)
-}
-
-// SetPath updates a nested path in the store
-func (s *Store[T]) SetPath(path []string, value any) {
-	s.state.Update(func(state T) T {
-		return updatePath(state, path, value, s.middleware).(T)
-	})
-}
-
-// Use adds middleware to the store
-func (s *Store[T]) Use(middleware func(path []string, value any, oldValue any) any) {
-	s.middleware = append(s.middleware, middleware)
-}
-
-// updatePath recursively updates a nested path in an object
-func updatePath(obj any, path []string, value any, middleware []func(path []string, value any, oldValue any) any) any {
-	if len(path) == 0 {
-		// Apply middleware
-		oldValue := obj
-		newValue := value
-		for _, mw := range middleware {
-			newValue = mw(path, value, oldValue)
+func (r *resourceImpl[T]) OnLoad(fn func(data T, err error)) {
+	Effect(r.owner, func() CleanUp {
+		if !r.Loading() {
+			fn(r.Data(), r.Error())
 		}
-		return newValue
-	}
+		return func() {}
+	}, []Reactive{r})
+}
 
-	if obj == nil {
-		return nil
-	}
+func (r *resourceImpl[T]) getNode() *node {
+	return r.node
+}
 
-	v := reflect.ValueOf(obj)
-	if v.Kind() == reflect.Ptr {
-		v = v.Elem()
-	}
+// Defer creates a signal that updates after a delay
+func Defer[T any](owner *Owner, source *signalImpl[T], timeoutMs int) *signalImpl[T] {
+	result := Signal(owner, source.Peek())
 
-	// Handle different container types
-	switch v.Kind() {
-	case reflect.Map:
-		key := reflect.ValueOf(path[0])
-		newMap := reflect.MakeMap(v.Type())
+	var timer *time.Timer
 
-		// Copy all existing entries
-		iter := v.MapRange()
-		for iter.Next() {
-			if iter.Key().String() == path[0] {
-				// Update this key with the recursive result
-				newValue := updatePath(iter.Value().Interface(), path[1:], value, middleware)
-				newMap.SetMapIndex(iter.Key(), reflect.ValueOf(newValue))
-			} else {
-				// Keep the same value
-				newMap.SetMapIndex(iter.Key(), iter.Value())
+	Effect(owner, func() CleanUp {
+		value := source.Get()
+
+		// Cancel existing timer
+		if timer != nil {
+			timer.Stop()
+		}
+
+		// Create new timer
+		timer = time.AfterFunc(time.Duration(timeoutMs)*time.Millisecond, func() {
+			result.Set(value)
+		})
+
+		return func() {
+			if timer != nil {
+				timer.Stop()
+				timer = nil
 			}
 		}
+	}, []Reactive{source})
 
-		// If the key doesn't exist yet, add it
-		if !v.MapIndex(key).IsValid() {
-			newMap.SetMapIndex(key, reflect.ValueOf(
-				updatePath(nil, path[1:], value, middleware),
-			))
+	return result
+}
+
+// Map transforms values with a mapping function
+func Map[T any, R any](
+	owner *Owner,
+	source *signalImpl[[]T],
+	mapFn func(item T, index int) R,
+) *signalImpl[[]R] {
+	return Memo(owner, func() []R {
+		items := source.Get()
+		result := make([]R, len(items))
+		for i, item := range items {
+			result[i] = mapFn(item, i)
 		}
+		return result
+	}, []Reactive{source})
+}
 
-		return newMap.Interface()
+// DerivedSignal creates a signal that's derived from another
+func DerivedSignal[T any, R any](
+	owner *Owner,
+	source *signalImpl[T],
+	get func(T) R,
+	set func(T, R) T,
+) *signalImpl[R] {
+	// Create derived signal
+	derived := Signal(owner, get(source.Peek()))
 
-	case reflect.Struct:
-		field := v.FieldByName(path[0])
-		if !field.IsValid() {
-			return obj // Field doesn't exist, return unchanged
-		}
+	// Set up bidirectional binding
+	var derivedCleanup CleanUp
 
-		// Create a new struct with the updated field
-		newStruct := reflect.New(v.Type()).Elem()
-		for i := 0; i < v.NumField(); i++ {
-			if v.Type().Field(i).Name == path[0] {
-				fieldValue := updatePath(field.Interface(), path[1:], value, middleware)
-				newStruct.Field(i).Set(reflect.ValueOf(fieldValue))
-			} else {
-				newStruct.Field(i).Set(v.Field(i))
+	// Track changes from source to derived
+	Effect(owner, func() CleanUp {
+		// Update derived when source changes
+		derived.Set(get(source.Get()))
+
+		// Set up reverse tracking (derived to source)
+		derivedCleanup = func() CleanUp {
+			Effect(owner, func() CleanUp {
+				// When derived changes, update source
+				newSource := set(source.Peek(), derived.Get())
+
+				// Only update if changed to avoid cycles
+				if !reflect.DeepEqual(source.Peek(), newSource) {
+					Untrack(owner, func() T {
+						source.Set(newSource)
+						return newSource
+					})
+				}
+				return func() {}
+			}, []Reactive{derived})
+
+			return func() {}
+		}()
+
+		return func() {
+			if derivedCleanup != nil {
+				derivedCleanup()
+				derivedCleanup = nil
 			}
 		}
+	}, []Reactive{source})
 
-		return newStruct.Interface()
+	return derived
+}
 
-	case reflect.Slice, reflect.Array:
-		index := 0
-		fmt.Sscanf(path[0], "%d", &index)
+// Computed represents a signal backed by a computation function
+type Computed[T any] struct {
+	value    *signalImpl[T]
+	compute  func() T
+	owner    *Owner
+	lastHash string // For detecting changes
+	mu       deadlock.Mutex
+}
 
-		if index < 0 || index >= v.Len() {
-			return obj // Index out of bounds, return unchanged
+// NewComputed creates a signal that gets its value from a compute function
+func NewComputed[T any](owner *Owner, compute func() T) *Computed[T] {
+	// Compute initial value
+	initial := compute()
+	computed := &Computed[T]{
+		value:   Signal(owner, initial),
+		compute: compute,
+		owner:   owner,
+	}
+
+	// Store hash of initial value
+	computed.updateHash(initial)
+
+	return computed
+}
+
+// Get returns the current value
+func (c *Computed[T]) Get() T {
+	return c.value.Get()
+}
+
+// Recompute executes the compute function and updates value if changed
+func (c *Computed[T]) Recompute() bool {
+	// Safely compute new value
+	c.mu.Lock()
+	newValue := c.compute()
+	changed := c.hasChanged(newValue)
+
+	if changed {
+		c.updateHash(newValue)
+		// Keep a copy of the value to set outside the lock
+		valueToSet := newValue
+		c.mu.Unlock()
+
+		// Set the new value after releasing our lock
+		c.value.Set(valueToSet)
+		return true
+	}
+
+	c.mu.Unlock()
+	return false
+}
+
+// updateHash stores a hash of the current value for change detection
+func (c *Computed[T]) updateHash(value T) {
+	hash := fmt.Sprintf("%v", value)
+	c.lastHash = hash
+}
+
+// hasChanged checks if value has changed from last value
+func (c *Computed[T]) hasChanged(value T) bool {
+	hash := fmt.Sprintf("%v", value)
+	return hash != c.lastHash
+}
+
+// getNode implements the Reactive interface
+func (c *Computed[T]) getNode() *node {
+	return c.value.getNode()
+}
+
+// Polling is a computed signal that refreshes on a timer
+type Polling[T any] struct {
+	*Computed[T]
+	ticker   *time.Ticker
+	stopChan chan struct{}
+	interval time.Duration
+	mu       deadlock.Mutex
+	active   bool
+}
+
+// NewPolling creates a computed signal that recomputes on an interval
+func NewPolling[T any](
+	owner *Owner,
+	compute func() T,
+	interval time.Duration,
+) *Polling[T] {
+	// Create base computed signal
+	computed := NewComputed(owner, compute)
+
+	// Create mutex-protected state
+	var mu deadlock.Mutex
+	active := true
+
+	// Create polling signal
+	polling := &Polling[T]{
+		Computed: computed,
+		interval: interval,
+		mu:       deadlock.Mutex{},
+		active:   true,
+	}
+
+	// Create channels under lock
+	mu.Lock()
+	ticker := time.NewTicker(interval)
+	stopChan := make(chan struct{})
+	polling.ticker = ticker
+	polling.stopChan = stopChan
+	mu.Unlock()
+
+	// For cleanup synchronization
+	var wg deadlock.WaitGroup
+	wg.Add(1)
+
+	// Start refresh loop in goroutine
+	go func() {
+		defer wg.Done()
+
+		for {
+			select {
+			case <-ticker.C:
+				mu.Lock()
+				if !active {
+					mu.Unlock()
+					return
+				}
+
+				// Get a local reference to the computed
+				comp := polling.Computed
+				mu.Unlock()
+
+				if comp != nil {
+					// Need global mutex to safely batch
+					batchMutex.Lock()
+					owner.mu.Lock()
+					oldBatch := owner.batchActive
+					owner.batchActive = true
+					owner.mu.Unlock()
+
+					// Try to recompute
+					comp.Recompute()
+
+					// Restore batch state and process if needed
+					owner.mu.Lock()
+					owner.batchActive = oldBatch
+					if !oldBatch {
+						queue := make([]*node, len(owner.batchQueue))
+						copy(queue, owner.batchQueue)
+						owner.batchQueue = owner.batchQueue[:0]
+						owner.batchSet = make(map[*node]struct{})
+						owner.mu.Unlock()
+						batchMutex.Unlock()
+
+						for _, n := range queue {
+							if n != nil && !n.disposed {
+								processNodeNotify(n)
+							}
+						}
+					} else {
+						owner.mu.Unlock()
+						batchMutex.Unlock()
+					}
+				}
+
+			case <-stopChan:
+				return
+			}
 		}
+	}()
 
-		// Create a new slice with the updated element
-		newSlice := reflect.MakeSlice(v.Type(), v.Len(), v.Cap())
-		reflect.Copy(newSlice, v)
+	// Register cleanup to stop the goroutine and wait for it
+	owner.mu.Lock()
+	owner.cleanups = append(owner.cleanups, func() {
+		mu.Lock()
+		active = false
+		if ticker != nil {
+			ticker.Stop()
+		}
+		close(stopChan)
+		mu.Unlock()
 
-		// Update the element
-		newElement := updatePath(v.Index(index).Interface(), path[1:], value, middleware)
-		newSlice.Index(index).Set(reflect.ValueOf(newElement))
-
-		return newSlice.Interface()
-
-	default:
-		return obj // Can't update, return unchanged
-	}
-}
-
-func isBatching() bool {
-	batchMutex.Lock()
-	defer batchMutex.Unlock()
-	return isBatchingFlag
-}
-
-func batchUpdate(update func()) {
-	batchMutex.Lock()
-	defer batchMutex.Unlock()
-	batchQueue = append(batchQueue, update)
-}
-
-// Accessor is a helper to get/set a signal with a single variable
-type Accessor[T any] struct {
-	signal *Signal[T]
-}
-
-// NewAccessor creates a new accessor for a signal
-func NewAccessor[T any](initialValue T) *Accessor[T] {
-	return &Accessor[T]{
-		signal: NewSignal(initialValue),
-	}
-}
-
-// Call gets or sets the signal value
-func (a *Accessor[T]) Call(args ...T) any {
-	if len(args) == 0 {
-		// Getter mode
-		return a.signal.Get()
-	}
-	// Setter mode
-	a.signal.Set(args[0])
-	return nil
-}
-
-// Selector creates a derived signal that selects part of another signal
-func Selector[T any, R any](source *Signal[T], selector func(T) R) *Computed[R] {
-	// Create a computed that will track the source signal
-	comp := NewComputed(func() R {
-		// Explicitly read the source value to create a dependency
-		sourceValue := source.Get()
-		return selector(sourceValue)
+		// Wait for goroutine to finish
+		wg.Wait()
 	})
+	owner.mu.Unlock()
 
-	// Ensure initial computation
-	comp.isStale = true
-	comp.Get()
-
-	return comp
+	return polling
 }
 
-// DerivedSignal creates a two-way bindable signal derived from another
-type DerivedSignal[T any, R any] struct {
-	source *Signal[T]
-	getter func(T) R
-	setter func(T, R) T
-}
-
-// NewDerivedSignal creates a derived signal with custom get/set functions
-func NewDerivedSignal[T any, R any](
-	source *Signal[T],
-	getter func(T) R,
-	setter func(T, R) T,
-) *DerivedSignal[T, R] {
-	return &DerivedSignal[T, R]{
-		source: source,
-		getter: getter,
-		setter: setter,
+// SetInterval changes the refresh interval
+func (p *Polling[T]) SetInterval(interval time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.interval = interval
+	if p.ticker != nil && p.active {
+		p.ticker.Reset(interval)
 	}
 }
 
-// Get retrieves the derived value
-func (d *DerivedSignal[T, R]) Get() R {
-	return d.getter(d.source.Get())
+// Pause temporarily stops auto-refreshing
+func (p *Polling[T]) Pause() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.ticker != nil && p.active {
+		p.ticker.Stop()
+	}
 }
 
-// Set updates the source through the derived signal
-func (d *DerivedSignal[T, R]) Set(value R) {
-	current := d.source.Get()
-	updated := d.setter(current, value)
-	d.source.Set(updated)
+// Resume restarts auto-refreshing
+func (p *Polling[T]) Resume() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.ticker != nil && p.active {
+		p.ticker.Reset(p.interval)
+	}
 }

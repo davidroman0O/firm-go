@@ -1,416 +1,381 @@
 package main
 
 import (
-	"errors"
 	"fmt"
+	"math/rand"
+	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/davidroman0O/firm-go"
 )
 
+// Define some example types
 type User struct {
-	Name     string
-	Age      int
-	Address  Address
-	Contacts []string
+	ID   int
+	Name string
 }
 
-type Address struct {
-	Street string
-	City   string
-	Zip    string
+type Todo struct {
+	ID        int
+	Text      string
+	Completed bool
+	UserID    int
 }
 
 func main() {
-	fmt.Println("=== Basic Signals ===")
-	basicSignalsExample()
+	// Create a reactive system
+	dispose := firm.Root(func(owner *firm.Owner) firm.CleanUp {
+		fmt.Println("=== Firm-Go Example ===")
 
-	fmt.Println("\n=== Computed Values ===")
-	computedExample()
+		// Basic signal example
+		count := firm.Signal(owner, 0)
+		message := firm.Signal(owner, "Hello")
 
-	fmt.Println("\n=== Effects ===")
-	effectsExample()
+		// Effect that runs when count changes
+		firm.Effect(owner, func() firm.CleanUp {
+			fmt.Printf("Count changed to: %d\n", count.Get())
+			return func() {
+				fmt.Println("Count effect cleanup")
+			}
+		}, []firm.Reactive{count})
 
-	fmt.Println("\n=== Batch Updates ===")
-	batchingExample()
+		// Computed value (memo) based on count
+		doubled := firm.Memo(owner, func() int {
+			return count.Get() * 2
+		}, []firm.Reactive{count})
 
-	fmt.Println("\n=== Resources ===")
-	resourceExample()
+		// Effect for the computed value
+		firm.Effect(owner, func() firm.CleanUp {
+			fmt.Printf("Doubled value: %d\n", doubled.Get())
+			return nil
+		}, []firm.Reactive{doubled})
 
-	fmt.Println("\n=== Store API ===")
-	storeExample()
+		// Context example - now much more useful!
+		themeContext := firm.NewContext(owner, "light")
 
-	fmt.Println("\n=== Accessor API ===")
-	accessorExample()
+		// Effect that uses the context
+		firm.Effect(owner, func() firm.CleanUp {
+			fmt.Printf("Current theme: %s\n", themeContext.Use())
+			return nil
+		}, []firm.Reactive{themeContext})
 
-	fmt.Println("\n=== Derived Signals ===")
-	derivedSignalExample()
+		// Setup theme-specific code blocks
+		themeContext.Match(owner, "dark", func(darkOwner *firm.Owner) firm.CleanUp {
+			// This code only runs when theme is "dark"
+			firm.Effect(darkOwner, func() firm.CleanUp {
+				fmt.Println("Dark mode activated!")
+				return nil
+			}, []firm.Reactive{})
 
-	fmt.Println("\n=== Root Context ===")
-	rootContextExample()
-}
-
-func basicSignalsExample() {
-	// Create a signal with initial value
-	count := firm.NewSignal(0)
-
-	// Subscribe to changes
-	unsub := count.Subscribe(func(newValue int) {
-		fmt.Printf("Count changed to: %d\n", newValue)
-	})
-
-	// Update the signal
-	count.Set(1)
-	count.Update(func(current int) int {
-		return current + 1
-	})
-
-	// Unsubscribe
-	unsub()
-
-	// This update won't trigger the callback
-	count.Set(10)
-	fmt.Printf("Final count (using Peek): %d\n", count.Peek())
-}
-
-func computedExample() {
-	// Create signals
-	firstName := firm.NewSignal("John")
-	lastName := firm.NewSignal("Doe")
-
-	// Create a computed value
-	fullName := firm.NewComputed(func() string {
-		return firstName.Get() + " " + lastName.Get()
-	})
-
-	// Create a memo (optimized computed with custom equality)
-	nameLength := firm.CreateMemo(func() int {
-		return len(fullName.Get())
-	}, func(a, b int) bool {
-		// Only update if the difference is more than 1 character
-		return a-b > -2 && a-b < 2
-	})
-
-	// Display initial values
-	fmt.Printf("Full name: %s, length: %d\n", fullName.Get(), nameLength.Get())
-
-	// Update signals
-	firstName.Set("Jane")
-	fmt.Printf("After update - Full name: %s, length: %d\n", fullName.Get(), nameLength.Get())
-
-	// This should not update the nameLength due to our custom equality function
-	// (difference is only 1 character)
-	lastName.Set("Doe ")
-	fmt.Printf("After small change - Full name: %s, length: %d\n", fullName.Get(), nameLength.Get())
-
-	// This should update the nameLength (difference is more than 1 character)
-	lastName.Set("Johnson")
-	fmt.Printf("After big change - Full name: %s, length: %d\n", fullName.Get(), nameLength.Get())
-}
-
-func effectsExample() {
-	// Create signals
-	text := firm.NewSignal("Hello")
-	count := firm.NewSignal(0)
-
-	// Create an effect with cleanup
-	effect := firm.CreateEffect(func() {
-		value := text.Get()
-		fmt.Printf("Text effect: %s\n", value)
-
-		// Register cleanup function
-		firm.OnCleanup(func() {
-			fmt.Printf("Cleaning up effect for: %s\n", value)
+			return func() {
+				fmt.Println("Dark mode deactivated!")
+			}
 		})
-	})
 
-	// Create an effect with untracked read
-	firm.CreateEffect(func() {
-		// This dependency is tracked
-		fmt.Printf("Count changed to: %d\n", count.Get())
+		themeContext.When(owner, func(theme string) bool {
+			// This code only runs when theme contains "light"
+			return theme == "light" || theme == "light-high-contrast"
+		}, func(lightOwner *firm.Owner) firm.CleanUp {
+			firm.Effect(lightOwner, func() firm.CleanUp {
+				fmt.Println("Light mode active")
+				return nil
+			}, []firm.Reactive{})
 
-		// This is read without tracking
-		untrackedValue := firm.Untrack(func() string {
-			return text.Get()
+			// Can use parent signals in this scope
+			firm.Effect(lightOwner, func() firm.CleanUp {
+				fmt.Printf("Light theme with count: %d\n", count.Get())
+				return nil
+			}, []firm.Reactive{count})
+
+			return func() {
+				fmt.Println("Light mode deactivated!")
+				count.Set(count.Get() + 1)
+			}
 		})
-		fmt.Printf("Untracked value: %s\n", untrackedValue)
-	})
 
-	// Update signals
-	text.Set("World")
-	count.Set(1)
+		// Async resource example
+		userResource := firm.Resource(owner, func() (User, error) {
+			// Simulate API call
+			time.Sleep(100 * time.Millisecond)
+			return User{ID: 1, Name: "John Doe"}, nil
+		})
 
-	// Changes to text won't affect the second effect
-	text.Set("Signals")
-	count.Set(2)
+		// Effect that reacts to resource state
+		firm.Effect(owner, func() firm.CleanUp {
+			if userResource.Loading() {
+				fmt.Println("Loading user...")
+			} else if err := userResource.Error(); err != nil {
+				fmt.Printf("Error loading user: %v\n", err)
+			} else {
+				user := userResource.Data()
+				fmt.Printf("User loaded: %s (ID: %d)\n", user.Name, user.ID)
+			}
+			return nil
+		}, []firm.Reactive{userResource})
 
-	// Dispose an effect
-	effect.Dispose()
-	text.Set("After Dispose") // Won't trigger the first effect
+		// Use a simple signal for todos
+		todos := firm.Signal(owner, []Todo{
+			{ID: 1, Text: "Learn Go", Completed: false, UserID: 1},
+			{ID: 2, Text: "Learn Firm-Go", Completed: false, UserID: 1},
+		})
 
-	fmt.Println("Effects test complete")
-}
+		// Effect to display todos
+		firm.Effect(owner, func() firm.CleanUp {
+			todoList := todos.Get()
+			fmt.Println("Current todos:")
+			for _, todo := range todoList {
+				status := "[ ]"
+				if todo.Completed {
+					status = "[x]"
+				}
+				fmt.Printf("  %s %s (ID: %d)\n", status, todo.Text, todo.ID)
+			}
+			return nil
+		}, []firm.Reactive{todos})
 
-func batchingExample() {
-	counter := firm.NewSignal(0)
-	effectCount := 0
+		// Computed for completed todos count
+		completedCount := firm.Memo(owner, func() int {
+			todoList := todos.Get()
+			count := 0
+			for _, todo := range todoList {
+				if todo.Completed {
+					count++
+				}
+			}
+			return count
+		}, []firm.Reactive{todos})
 
-	// Create an effect to track how many times it runs
-	firm.CreateEffect(func() {
-		// Just access the counter to create dependency
-		_ = counter.Get()
-		effectCount++
-	})
+		// Effect for completed count
+		firm.Effect(owner, func() firm.CleanUp {
+			fmt.Printf("Completed todos: %d/%d\n", completedCount.Get(), len(todos.Get()))
+			return nil
+		}, []firm.Reactive{completedCount, todos})
 
-	// Reset the count after the initial effect run
-	effectCount = 0
+		// Deferred signal that updates after a delay
+		delayedMessage := firm.Defer(owner, message, 500) // 500ms delay
 
-	// Individual updates
-	fmt.Println("Individual updates:")
-	counter.Set(1)
-	counter.Set(2)
-	counter.Set(3)
-	fmt.Printf("Effect ran %d times\n", effectCount)
+		firm.Effect(owner, func() firm.CleanUp {
+			fmt.Printf("Delayed message: %s\n", delayedMessage.Get())
+			return nil
+		}, []firm.Reactive{delayedMessage})
 
-	// Reset count
-	effectCount = 0
+		// Map example
+		todoTexts := firm.Memo(owner, func() []string {
+			todoList := todos.Get()
+			texts := make([]string, len(todoList))
+			for i, todo := range todoList {
+				texts[i] = todo.Text
+			}
+			return texts
+		}, []firm.Reactive{todos})
 
-	// Batched updates
-	fmt.Println("Batched updates:")
-	firm.Batch(func() {
-		counter.Set(10)
-		counter.Set(20)
-		counter.Set(30)
-		// Manually check the value inside batch
-		fmt.Printf("Counter inside batch: %d\n", counter.Get())
-	})
+		todoLabels := firm.Map(
+			owner,
+			todoTexts,
+			func(text string, index int) string {
+				return fmt.Sprintf("%d: %s", index+1, text)
+			},
+		)
 
-	fmt.Printf("Counter after batch: %d\n", counter.Get())
-	fmt.Printf("Effect ran %d time\n", effectCount)
-}
+		firm.Effect(owner, func() firm.CleanUp {
+			fmt.Println("Todo labels:")
+			for _, label := range todoLabels.Get() {
+				fmt.Printf("  %s\n", label)
+			}
+			return nil
+		}, []firm.Reactive{todoLabels})
 
-func resourceExample() {
-	// Simulate an async API call
-	fetchUser := func() (User, error) {
-		// Simulate network delay
-		time.Sleep(100 * time.Millisecond)
+		// Derived signal example
+		userName := firm.Signal(owner, "john.doe")
+		userDisplayName := firm.DerivedSignal(
+			owner,
+			userName,
+			func(name string) string { return "User: " + name },
+			func(original string, display string) string {
+				// This updates the original when display changes
+				if len(display) > 6 {
+					return display[6:] // Remove "User: " prefix
+				}
+				return original
+			},
+		)
 
-		// Randomly succeed or fail to demonstrate error handling
-		if time.Now().UnixNano()%2 == 0 {
-			return User{
-				Name: "John Doe",
-				Age:  30,
-				Address: Address{
-					Street: "123 Main St",
-					City:   "Anytown",
-					Zip:    "12345",
-				},
-				Contacts: []string{"john@example.com", "555-1234"},
-			}, nil
+		firm.Effect(owner, func() firm.CleanUp {
+			fmt.Printf("User display name: %s\n", userDisplayName.Get())
+			return nil
+		}, []firm.Reactive{userDisplayName})
+
+		// Computed example - a value that can be manually recomputed
+		randomNumber := firm.NewComputed(owner, func() int {
+			return rand.Intn(100) // Generate random number between 0-99
+		})
+
+		firm.Effect(owner, func() firm.CleanUp {
+			fmt.Printf("Random number: %d\n", randomNumber.Get())
+			return nil
+		}, []firm.Reactive{randomNumber})
+
+		// Computed example with file system data
+		currentDir := firm.NewComputed(owner, func() []string {
+			// Get current directory contents
+			dir, err := os.Getwd()
+			if err != nil {
+				return []string{"Error getting directory"}
+			}
+
+			entries, err := os.ReadDir(dir)
+			if err != nil {
+				return []string{"Error reading directory"}
+			}
+
+			result := make([]string, 0, len(entries))
+			for _, entry := range entries {
+				// Only include non-hidden files and directories
+				if !strings.HasPrefix(entry.Name(), ".") {
+					if entry.IsDir() {
+						result = append(result, "📁 "+entry.Name())
+					} else {
+						result = append(result, "📄 "+entry.Name())
+					}
+				}
+			}
+
+			return result
+		})
+
+		firm.Effect(owner, func() firm.CleanUp {
+			files := currentDir.Get()
+			if len(files) > 0 {
+				fmt.Println("\nDirectory contents:")
+				for i, file := range files {
+					if i < 5 { // Show only first 5 items
+						fmt.Printf("  %s\n", file)
+					} else {
+						fmt.Println("  ...")
+						break
+					}
+				}
+				fmt.Printf("  (%d items total)\n", len(files))
+			}
+			return nil
+		}, []firm.Reactive{currentDir})
+
+		// Polling example - automatically updates current time
+		currentTime := firm.NewPolling(owner, func() string {
+			return time.Now().Format("15:04:05")
+		}, 1*time.Second) // Update every second
+
+		firm.Effect(owner, func() firm.CleanUp {
+			fmt.Printf("Current time: %s\n", currentTime.Get())
+			return nil
+		}, []firm.Reactive{currentTime})
+
+		// Polling example that watches a specific file
+		tmpFilePath := filepath.Join(os.TempDir(), "firm-demo.txt")
+
+		// Create the initial file
+		if f, err := os.Create(tmpFilePath); err == nil {
+			f.WriteString("Initial content")
+			f.Close()
 		}
 
-		return User{}, errors.New("failed to fetch user")
-	}
+		fileContent := firm.NewPolling(owner, func() string {
+			content, err := os.ReadFile(tmpFilePath)
+			if err != nil {
+				return "Error reading file"
+			}
+			return string(content)
+		}, 500*time.Millisecond) // Check every 500ms
 
-	// Create a resource
-	userResource := firm.CreateResource(fetchUser)
+		firm.Effect(owner, func() firm.CleanUp {
+			fmt.Printf("File content: %s\n", fileContent.Get())
+			return func() {
+				// Clean up temp file on exit
+				os.Remove(tmpFilePath)
+			}
+		}, []firm.Reactive{fileContent})
 
-	// Initial state (should be loading)
-	state := userResource.Read()
-	fmt.Printf("Initial state - Loading: %v, Error: %v\n", state.Loading, state.Error)
+		// Now let's make some changes to demonstrate reactivity
+		fmt.Println("\n=== Making changes ===")
 
-	// Wait for the resource to complete loading
-	time.Sleep(200 * time.Millisecond)
+		// Batch multiple updates
+		firm.Batch(owner, func() {
+			// Update count which triggers effects and memos
+			count.Set(5)
 
-	// Check the result
-	state = userResource.Read()
-	if state.Error != nil {
-		fmt.Printf("Resource error: %v\n", state.Error)
-	} else {
-		fmt.Printf("Resource loaded - User: %s, Age: %d\n", state.Data.Name, state.Data.Age)
-	}
+			// Mark a todo as completed - direct mutation with Get and Set
+			todoList := todos.Get()
+			todoList[0].Completed = true // Mark first todo as completed
+			todos.Set(todoList)          // Set the entire list back to trigger reactivity
 
-	// Manually trigger a refetch
-	fmt.Println("Refetching resource...")
-	userResource.Refetch()
+			// Add a new todo
+			todoList = todos.Get() // Get latest version
+			todoList = append(todoList, Todo{ID: 3, Text: "Master Firm-Go", Completed: false, UserID: 1})
+			todos.Set(todoList) // Set the entire list back
 
-	// Wait for the refetch to complete
-	time.Sleep(200 * time.Millisecond)
+			// Update message which will be reflected in delayed message after 500ms
+			message.Set("Updated message")
 
-	// Check the result again
-	state = userResource.Read()
-	fmt.Printf("After refetch - Loading: %v, Has error: %v\n", state.Loading, state.Error != nil)
-	if state.Error == nil {
-		fmt.Printf("User data: %+v\n", state.Data)
-	}
-}
-
-func storeExample() {
-	// Create a store with a complex object
-	userStore := firm.CreateStore(User{
-		Name: "John Doe",
-		Age:  30,
-		Address: Address{
-			Street: "123 Main St",
-			City:   "Anytown",
-			Zip:    "12345",
-		},
-		Contacts: []string{"john@example.com", "555-1234"},
-	})
-
-	// Create effect to watch for changes
-	firm.CreateEffect(func() {
-		user := userStore.Get()
-		fmt.Printf("User updated: %s, %d, %s\n", user.Name, user.Age, user.Address.City)
-	})
-
-	// Update individual properties using the path API
-	fmt.Println("Updating the user's name...")
-	userStore.SetPath([]string{"Name"}, "Jane Doe")
-
-	// Update nested property
-	fmt.Println("Updating the user's city...")
-	userStore.SetPath([]string{"Address", "City"}, "New City")
-
-	// Update array element
-	fmt.Println("Updating contact email...")
-	userStore.SetPath([]string{"Contacts", "0"}, "jane@example.com")
-
-	// Create middleware for logging
-	userStore.Use(func(path []string, newValue any, oldValue any) any {
-		fmt.Printf("Store middleware - Path: %v, Old: %v, New: %v\n", path, oldValue, newValue)
-		return newValue // Return the value unchanged
-	})
-
-	// This update will trigger the middleware
-	fmt.Println("Updating with middleware...")
-	userStore.SetPath([]string{"Age"}, 31)
-
-	// Get the final state
-	finalUser := userStore.Get()
-	fmt.Printf("Final store state: %+v\n", finalUser)
-	fmt.Printf("Address: %+v\n", finalUser.Address)
-	fmt.Printf("Contacts: %v\n", finalUser.Contacts)
-}
-
-func accessorExample() {
-	// Create an accessor (similar to Solid's createSignal but with single function API)
-	count := firm.NewAccessor(0)
-
-	// Use the accessor as a getter
-	value := count.Call().(int)
-	fmt.Printf("Initial accessor value: %d\n", value)
-
-	// Use the accessor as a setter
-	count.Call(10)
-
-	// Get the updated value
-	value = count.Call().(int)
-	fmt.Printf("Updated accessor value: %d\n", value)
-
-	// Create a computed value that depends on the accessor
-	doubled := firm.NewComputed(func() int {
-		return count.Call().(int) * 2
-	})
-
-	fmt.Printf("Computed from accessor: %d\n", doubled.Get())
-
-	// Update through the accessor again
-	count.Call(20)
-	fmt.Printf("Computed after update: %d\n", doubled.Get())
-}
-
-func derivedSignalExample() {
-	// Create a base signal
-	user := firm.NewSignal(User{
-		Name: "John Doe",
-		Age:  30,
-		Address: Address{
-			Street: "123 Main St",
-			City:   "Anytown",
-			Zip:    "12345",
-		},
-	})
-
-	// Create a selector for a specific property
-	nameSignal := firm.Selector(user, func(u User) string {
-		return u.Name
-	})
-
-	fmt.Printf("Selected name: %s\n", nameSignal.Get())
-
-	// Create a derived signal with custom getter and setter
-	ageSignal := firm.NewDerivedSignal(
-		user,
-		// Getter extracts age from user
-		func(u User) int {
-			return u.Age
-		},
-		// Setter updates age in user
-		func(u User, newAge int) User {
-			u.Age = newAge
-			return u
-		},
-	)
-
-	fmt.Printf("Derived age: %d\n", ageSignal.Get())
-
-	// Update through the derived signal
-	ageSignal.Set(40)
-
-	// Check that the update affected the original signal
-	updatedUser := user.Get()
-	fmt.Printf("User after derived update - Name: %s, Age: %d\n",
-		updatedUser.Name, updatedUser.Age)
-
-	// Update the original signal
-	updatedUser.Name = "Jane Doe"
-	user.Set(updatedUser)
-
-	// Check that the selector was updated
-	fmt.Printf("Selected name after update: %s\n", nameSignal.Get())
-}
-
-func rootContextExample() {
-	// Create a root context
-	dispose := firm.CreateRoot(func() {
-		// Signals created here will be disposed when the root is disposed
-		counter := firm.NewSignal(0)
-
-		// Create an effect in this context
-		firm.CreateEffect(func() {
-			value := counter.Get()
-			fmt.Printf("Root context effect: %d\n", value)
+			// Update user name which updates the derived display name
+			userName.Set("jane.doe")
 		})
 
-		// Update within the context
-		counter.Set(1)
-		counter.Set(2)
+		// Update the temp file
+		go func() {
+			time.Sleep(300 * time.Millisecond)
+			if f, err := os.OpenFile(tmpFilePath, os.O_WRONLY|os.O_TRUNC, 0644); err == nil {
+				f.WriteString("Updated content")
+				f.Close()
+				fmt.Println("\n=== Updated file content ===")
+			}
+		}()
 
-		// Child context
-		childDispose := firm.CreateRoot(func() {
-			childCounter := firm.NewSignal(100)
+		// Force recompute the random number
+		go func() {
+			time.Sleep(400 * time.Millisecond)
+			fmt.Println("\n=== Recomputing random number ===")
+			randomNumber.Recompute()
+		}()
 
-			firm.CreateEffect(func() {
-				parentValue := counter.Get()
-				childValue := childCounter.Get()
-				fmt.Printf("Child context effect: parent=%d, child=%d\n",
-					parentValue, childValue)
-			})
+		// Wait a bit then change the theme to demonstrate conditional contexts
+		time.Sleep(600 * time.Millisecond)
+		fmt.Println("\n=== Changing theme ===")
+		themeContext.Set("dark")
 
-			childCounter.Set(101)
-		})
+		// Change it back after a delay
+		time.Sleep(600 * time.Millisecond)
+		fmt.Println("\n=== Changing theme back ===")
+		themeContext.Set("light")
 
-		// Dispose the child context
-		fmt.Println("Disposing child context...")
-		childDispose()
+		// Pause the time polling temporarily
+		go func() {
+			time.Sleep(200 * time.Millisecond)
+			fmt.Println("\n=== Pausing time updates ===")
+			currentTime.Pause()
 
-		// Updates still work in parent context
-		counter.Set(3)
+			time.Sleep(2 * time.Second)
+			fmt.Println("\n=== Resuming time updates ===")
+			currentTime.Resume()
+		}()
+
+		// Recompute directory contents after some files might have changed
+		go func() {
+			time.Sleep(1200 * time.Millisecond)
+			fmt.Println("\n=== Refreshing directory contents ===")
+			currentDir.Recompute()
+		}()
+
+		// Set up a cleanup function
+		return func() {
+			fmt.Println("\n=== Cleaning up ===")
+		}
 	})
 
-	// Dispose the root context
-	fmt.Println("Disposing root context...")
+	// Wait a bit to see the delayed effects
+	time.Sleep(4 * time.Second)
+
+	// Dispose when done
 	dispose()
-	fmt.Println("Root context disposed.")
 }
