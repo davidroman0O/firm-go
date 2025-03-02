@@ -60,13 +60,46 @@ func fetchWeather(location string) (Weather, error) {
 
 func main() {
 	fmt.Println("🚀 Firm-Go Demo Application")
+
+	disposeFirst, waitFirst := firm.Root(func(owner *firm.Owner) firm.CleanUp {
+		search := firm.Signal(owner, "")
+
+		// Debounced search query - updates 300ms after the source
+		debouncedSearch := firm.Defer(owner, search, 300)
+
+		firm.Effect(owner, func() firm.CleanUp {
+			// Only runs when the debounced value changes
+			query := debouncedSearch.Get()
+			if query != "" {
+				fmt.Println("Searching for:", query)
+				// performSearch(query)
+			}
+			return nil
+		}, nil)
+
+		// These rapid updates only result in one search
+		search.Set("a")
+		search.Set("ap")
+		search.Set("app")
+		search.Set("appl")
+		search.Set("apple")
+
+		return func() {
+			fmt.Println("🧹 Root Cleanup executed")
+		}
+	})
+
+	waitFirst()
+
+	disposeFirst()
+
 	fmt.Println("===========================")
 
 	// Initialize random seed
 	rand.Seed(time.Now().UnixNano())
 
 	// Create root reactive system
-	cleanup := firm.Root(func(owner *firm.Owner) firm.CleanUp {
+	cleanup, waiting := firm.Root(func(owner *firm.Owner) firm.CleanUp {
 		fmt.Println("\n--- 1. Signals Demonstration ---")
 
 		// Create basic signals
@@ -329,6 +362,8 @@ func main() {
 			fmt.Println("🧹 Root cleanup executed")
 		}
 	})
+
+	waiting()
 
 	// Finally, clean up the root
 	cleanup()

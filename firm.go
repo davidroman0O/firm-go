@@ -118,6 +118,7 @@ type Owner struct {
 	batchQueue    []*node
 	batchSet      map[*node]struct{}
 	cleanups      []CleanUp
+	pendingOps    deadlock.WaitGroup
 }
 
 // NewOwner creates a new owner
@@ -131,19 +132,39 @@ func NewOwner() *Owner {
 }
 
 // Root creates a reactive system
-func Root(fn func(r *Owner) CleanUp) CleanUp {
+func Root(fn func(r *Owner) CleanUp) (cleanup CleanUp, wait func()) {
 	owner := NewOwner()
-	cleanup := fn(owner)
+	userCleanup := fn(owner)
 
-	return func() {
-		// First run the user-provided cleanup
-		if cleanup != nil {
-			cleanup()
+	// Create a wait function that waits for all pending operations
+	wait = func() {
+		owner.WaitForPending()
+	}
+
+	// Standard cleanup function
+	cleanup = func() {
+		if userCleanup != nil {
+			userCleanup()
 		}
-
-		// Then clean up the owner
 		owner.dispose()
 	}
+
+	return cleanup, wait
+}
+
+// Track a pending operation
+func (o *Owner) TrackPendingOp() {
+	o.pendingOps.Add(1)
+}
+
+// Complete a pending operation
+func (o *Owner) CompletePendingOp() {
+	o.pendingOps.Done()
+}
+
+// Wait for all pending operations
+func (o *Owner) WaitForPending() {
+	o.pendingOps.Wait()
 }
 
 func createNode(owner *Owner) *node {
@@ -699,7 +720,7 @@ func Resource[T any](
 	// Use WaitGroup for synchronization
 	var fetchWg deadlock.WaitGroup
 	var fetchMu deadlock.Mutex
-	var active bool = true
+	var active = true
 
 	resource := &resourceImpl[T]{
 		owner:   owner,
@@ -709,7 +730,7 @@ func Resource[T any](
 		node:    resourceNode,
 	}
 
-	// Create refetch function with better synchronization
+	// Create refetch function with proper synchronization
 	resource.refetch = func() {
 		fetchMu.Lock()
 		if !active {
@@ -718,11 +739,17 @@ func Resource[T any](
 		}
 		loading.Set(true)
 		fetchWg.Add(1)
+
+		// Track this async operation
+		owner.TrackPendingOp()
+
 		fetchMu.Unlock()
 
 		go func() {
 			defer fetchWg.Done()
+			defer owner.CompletePendingOp() // Signal completion
 
+			// Fetch the data
 			result, fetchErr := fetcher()
 
 			fetchMu.Lock()
@@ -731,6 +758,7 @@ func Resource[T any](
 				return
 			}
 
+			// Update resource state atomically
 			Batch(owner, func() {
 				if fetchErr != nil {
 					err.Set(fetchErr)
@@ -740,6 +768,7 @@ func Resource[T any](
 				loading.Set(false)
 				resourceNode.notify()
 			})
+
 			fetchMu.Unlock()
 		}()
 	}
@@ -747,7 +776,7 @@ func Resource[T any](
 	// Initial fetch
 	resource.refetch()
 
-	// Register cleanup that waits for ongoing fetches
+	// Register cleanup
 	owner.mu.Lock()
 	owner.cleanups = append(owner.cleanups, func() {
 		fetchMu.Lock()
@@ -799,25 +828,52 @@ func Defer[T any](owner *Owner, source *signalImpl[T], timeoutMs int) *signalImp
 	result := Signal(owner, source.Peek())
 
 	var timer *time.Timer
+	var mu deadlock.Mutex
+	var pendingOpActive bool
 
 	Effect(owner, func() CleanUp {
 		value := source.Get()
 
+		mu.Lock()
 		// Cancel existing timer
 		if timer != nil {
 			timer.Stop()
+			timer = nil
 		}
+
+		// Track this pending operation, but only once per effect cycle
+		if !pendingOpActive {
+			owner.TrackPendingOp()
+			pendingOpActive = true
+		}
+		mu.Unlock()
 
 		// Create new timer
 		timer = time.AfterFunc(time.Duration(timeoutMs)*time.Millisecond, func() {
 			result.Set(value)
+
+			mu.Lock()
+			// Only complete if we actually tracked an operation
+			if pendingOpActive {
+				owner.CompletePendingOp()
+				pendingOpActive = false
+			}
+			mu.Unlock()
 		})
 
 		return func() {
+			mu.Lock()
 			if timer != nil {
 				timer.Stop()
 				timer = nil
 			}
+
+			// Make sure we complete the pending op during cleanup
+			if pendingOpActive {
+				owner.CompletePendingOp()
+				pendingOpActive = false
+			}
+			mu.Unlock()
 		}
 	}, []Reactive{source})
 
@@ -1000,6 +1056,10 @@ func NewPolling[T any](
 	var wg deadlock.WaitGroup
 	wg.Add(1)
 
+	// Track just the initial setup as pending
+	owner.TrackPendingOp()
+	initialCycleDone := false
+
 	// Start refresh loop in goroutine
 	go func() {
 		defer wg.Done()
@@ -1048,9 +1108,19 @@ func NewPolling[T any](
 						owner.mu.Unlock()
 						batchMutex.Unlock()
 					}
+
+					// After first cycle, signal initial setup is complete
+					if !initialCycleDone {
+						initialCycleDone = true
+						owner.CompletePendingOp()
+					}
 				}
 
 			case <-stopChan:
+				// If we never completed a cycle, signal completion
+				if !initialCycleDone {
+					owner.CompletePendingOp()
+				}
 				return
 			}
 		}

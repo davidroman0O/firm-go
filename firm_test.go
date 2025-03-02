@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"reflect"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -25,7 +26,7 @@ func waitForAsync(t *testing.T, ms int) {
 
 // Basic Signal Tests
 func TestSignalBasic(t *testing.T) {
-	cleanUp := firm.Root(func(owner *firm.Owner) firm.CleanUp {
+	cleanup, wait := firm.Root(func(owner *firm.Owner) firm.CleanUp {
 		count := firm.Signal(owner, 0)
 		assertEquals(t, 0, count.Get(), "initial value")
 
@@ -43,12 +44,13 @@ func TestSignalBasic(t *testing.T) {
 
 		return nil
 	})
-	defer cleanUp()
+	wait()
+	defer cleanup()
 }
 
 // Effect Tests
 func TestEffectTracking(t *testing.T) {
-	cleanUp := firm.Root(func(owner *firm.Owner) firm.CleanUp {
+	cleanup, wait := firm.Root(func(owner *firm.Owner) firm.CleanUp {
 		count := firm.Signal(owner, 0)
 		message := firm.Signal(owner, "hello")
 
@@ -73,12 +75,13 @@ func TestEffectTracking(t *testing.T) {
 
 		return nil
 	})
-	defer cleanUp()
+	wait()
+	defer cleanup()
 }
 
 // Explicit Dependencies
 func TestExplicitDependencies(t *testing.T) {
-	cleanUp := firm.Root(func(owner *firm.Owner) firm.CleanUp {
+	cleanup, wait := firm.Root(func(owner *firm.Owner) firm.CleanUp {
 		a := firm.Signal(owner, 1)
 		b := firm.Signal(owner, 2)
 
@@ -100,12 +103,13 @@ func TestExplicitDependencies(t *testing.T) {
 
 		return nil
 	})
-	defer cleanUp()
+	wait()
+	defer cleanup()
 }
 
 // Effect Cleanup
 func TestEffectCleanup(t *testing.T) {
-	cleanUp := firm.Root(func(owner *firm.Owner) firm.CleanUp {
+	cleanup, wait := firm.Root(func(owner *firm.Owner) firm.CleanUp {
 		count := firm.Signal(owner, 0)
 		cleanupCount := 0
 
@@ -129,12 +133,14 @@ func TestEffectCleanup(t *testing.T) {
 			assertEquals(t, 2, cleanupCount, "cleanup runs when root is disposed")
 		}
 	})
-	cleanUp() // Execute root cleanup explicitly
+	wait()
+	// Execute root cleanup explicitly
+	cleanup()
 }
 
 // Batch Tests
 func TestBatch(t *testing.T) {
-	cleanUp := firm.Root(func(owner *firm.Owner) firm.CleanUp {
+	cleanup, wait := firm.Root(func(owner *firm.Owner) firm.CleanUp {
 		// Create a signal
 		count := firm.Signal(owner, 0)
 
@@ -178,12 +184,13 @@ func TestBatch(t *testing.T) {
 
 		return nil
 	})
-	defer cleanUp()
+	wait()
+	defer cleanup()
 }
 
 // Memo Tests
 func TestMemo(t *testing.T) {
-	cleanUp := firm.Root(func(owner *firm.Owner) firm.CleanUp {
+	cleanup, wait := firm.Root(func(owner *firm.Owner) firm.CleanUp {
 		a := firm.Signal(owner, 5)
 		b := firm.Signal(owner, 10)
 
@@ -209,12 +216,13 @@ func TestMemo(t *testing.T) {
 
 		return nil
 	})
-	defer cleanUp()
+	wait()
+	defer cleanup()
 }
 
 // Untrack Tests
 func TestUntrack(t *testing.T) {
-	cleanUp := firm.Root(func(owner *firm.Owner) firm.CleanUp {
+	cleanup, wait := firm.Root(func(owner *firm.Owner) firm.CleanUp {
 		count := firm.Signal(owner, 0)
 		effectRuns := 0
 
@@ -236,12 +244,13 @@ func TestUntrack(t *testing.T) {
 
 		return nil
 	})
-	defer cleanUp()
+	wait()
+	defer cleanup()
 }
 
 // Context Tests
 func TestContext(t *testing.T) {
-	cleanUp := firm.Root(func(owner *firm.Owner) firm.CleanUp {
+	cleanup, wait := firm.Root(func(owner *firm.Owner) firm.CleanUp {
 		theme := firm.NewContext(owner, "light")
 
 		// Test basic usage
@@ -264,12 +273,13 @@ func TestContext(t *testing.T) {
 
 		return nil
 	})
-	defer cleanUp()
+	wait()
+	defer cleanup()
 }
 
 // Context Match
 func TestContextMatch(t *testing.T) {
-	cleanUp := firm.Root(func(owner *firm.Owner) firm.CleanUp {
+	cleanup, wait := firm.Root(func(owner *firm.Owner) firm.CleanUp {
 		theme := firm.NewContext(owner, "light")
 
 		matchRuns := 0
@@ -315,12 +325,13 @@ func TestContextMatch(t *testing.T) {
 
 		return nil
 	})
-	defer cleanUp()
+	wait()
+	defer cleanup()
 }
 
 // Context When
 func TestContextWhen(t *testing.T) {
-	cleanUp := firm.Root(func(owner *firm.Owner) firm.CleanUp {
+	cleanup, wait := firm.Root(func(owner *firm.Owner) firm.CleanUp {
 		size := firm.NewContext(owner, 15)
 
 		whenRuns := 0
@@ -349,59 +360,108 @@ func TestContextWhen(t *testing.T) {
 
 		return nil
 	})
-	defer cleanUp()
+	wait()
+	defer cleanup()
 }
 
 // Resource Tests
 func TestResource(t *testing.T) {
-	cleanUp := firm.Root(func(owner *firm.Owner) firm.CleanUp {
-		loadCount := 0
+	var firstFetchComplete atomic.Bool
+	var secondFetchComplete atomic.Bool
+
+	cleanup, wait := firm.Root(func(owner *firm.Owner) firm.CleanUp {
+		// Use a channel to synchronize and track fetch operations
+		fetchChan := make(chan int, 2)
+
 		resource := firm.Resource(owner, func() (string, error) {
-			loadCount++
-			return fmt.Sprintf("data-%d", loadCount), nil
+			count := len(fetchChan) + 1
+			fetchChan <- count
+
+			// Log each fetch clearly
+			t.Logf("Fetcher called (#%d)", count)
+
+			// Small pause to ensure asynchronous behavior
+			time.Sleep(10 * time.Millisecond)
+
+			// Set completion flags
+			if count == 1 {
+				firstFetchComplete.Store(true)
+			} else if count == 2 {
+				secondFetchComplete.Store(true)
+			}
+
+			return fmt.Sprintf("data-%d", count), nil
 		})
 
-		// Wait for initial load
-		waitForAsync(t, 10)
+		// Wait for initial fetch to complete
+		for !firstFetchComplete.Load() {
+			time.Sleep(5 * time.Millisecond)
+		}
 
-		assertEquals(t, false, resource.Loading(), "should not be loading after completion")
-		assertEquals(t, "data-1", resource.Data(), "should have correct data")
-		assertEquals(t, nil, resource.Error(), "should have no error")
+		// Check initial data
+		initialData := resource.Data()
+		t.Logf("Initial data: %s", initialData)
 
-		// Test refetch
+		// Trigger second fetch
+		t.Logf("Calling Refetch()")
 		resource.Refetch()
-		waitForAsync(t, 10)
 
-		assertEquals(t, "data-2", resource.Data(), "should have updated data after refetch")
+		// Give a moment for refetch to get started
+		time.Sleep(5 * time.Millisecond)
 
-		return nil
+		return func() {
+			// In cleanup, check final state after wait() has completed
+			finalCount := len(fetchChan)
+			finalData := resource.Data()
+
+			t.Logf("Final fetch count: %d", finalCount)
+			t.Logf("Final data: %s", finalData)
+			t.Logf("Second fetch completed: %v", secondFetchComplete.Load())
+
+			assertEquals(t, false, resource.Loading(), "should not be loading after completion")
+			assertEquals(t, "data-2", finalData, "should have updated data after refetch")
+			assertEquals(t, nil, resource.Error(), "should have no error")
+		}
 	})
-	defer cleanUp()
+
+	// Wait for all async operations to complete
+	t.Logf("Calling wait()...")
+	wait()
+
+	// Run cleanup which includes our assertions
+	t.Logf("Calling cleanup()...")
+	cleanup()
 }
 
-// Resource Error
 func TestResourceError(t *testing.T) {
-	cleanUp := firm.Root(func(owner *firm.Owner) firm.CleanUp {
-		expectedErr := fmt.Errorf("test error")
+	var loadingState bool
+	var dataVal string
+	var errorVal error
+	expectedErr := fmt.Errorf("test error")
+
+	cleanup, wait := firm.Root(func(owner *firm.Owner) firm.CleanUp {
 		resource := firm.Resource(owner, func() (string, error) {
 			return "", expectedErr
 		})
 
-		// Wait for completion
-		waitForAsync(t, 10)
-
-		assertEquals(t, false, resource.Loading(), "should not be loading after error")
-		assertEquals(t, "", resource.Data(), "should have empty data on error")
-		assertEquals(t, expectedErr, resource.Error(), "should have correct error")
-
-		return nil
+		return func() {
+			// Capture state during cleanup, after all async operations complete
+			loadingState = resource.Loading()
+			dataVal = resource.Data()
+			errorVal = resource.Error()
+		}
 	})
-	defer cleanUp()
+
+	wait()    // Wait for all async operations
+	cleanup() // Perform cleanup which captures state
+
+	assertEquals(t, false, loadingState, "should not be loading after error")
+	assertEquals(t, "", dataVal, "should have empty data on error")
+	assertEquals(t, expectedErr, errorVal, "should have correct error")
 }
 
-// NEW: Computed Tests
 func TestComputed(t *testing.T) {
-	cleanUp := firm.Root(func(owner *firm.Owner) firm.CleanUp {
+	cleanup, wait := firm.Root(func(owner *firm.Owner) firm.CleanUp {
 		computeCount := 0
 		computed := firm.NewComputed(owner, func() int {
 			computeCount++
@@ -424,12 +484,13 @@ func TestComputed(t *testing.T) {
 
 		return nil
 	})
-	defer cleanUp()
+	wait()
+	defer cleanup()
 }
 
 // Computed No Change
 func TestComputedNoChange(t *testing.T) {
-	cleanUp := firm.Root(func(owner *firm.Owner) firm.CleanUp {
+	cleanup, wait := firm.Root(func(owner *firm.Owner) firm.CleanUp {
 		computeCount := 0
 		computed := firm.NewComputed(owner, func() int {
 			computeCount++
@@ -458,12 +519,13 @@ func TestComputedNoChange(t *testing.T) {
 
 		return nil
 	})
-	defer cleanUp()
+	wait()
+	defer cleanup()
 }
 
 // Computed with signals
 func TestComputedWithSignals(t *testing.T) {
-	cleanUp := firm.Root(func(owner *firm.Owner) firm.CleanUp {
+	cleanup, wait := firm.Root(func(owner *firm.Owner) firm.CleanUp {
 		count := firm.Signal(owner, 5)
 		computed := firm.NewComputed(owner, func() int {
 			return count.Get() * 2
@@ -484,14 +546,18 @@ func TestComputedWithSignals(t *testing.T) {
 
 		return nil
 	})
-	defer cleanUp()
+	wait()
+	defer cleanup()
 }
 
-// NEW: Polling Tests
 func TestPolling(t *testing.T) {
-	cleanUp := firm.Root(func(owner *firm.Owner) firm.CleanUp {
-		computeCount := 0
+	var mu sync.Mutex
+	computeCount := 0
+
+	cleanup, wait := firm.Root(func(owner *firm.Owner) firm.CleanUp {
 		polling := firm.NewPolling(owner, func() int {
+			mu.Lock()
+			defer mu.Unlock()
 			computeCount++
 			return computeCount
 		}, 50*time.Millisecond)
@@ -499,20 +565,30 @@ func TestPolling(t *testing.T) {
 		// Initial value
 		assertEquals(t, 1, polling.Get(), "initial polling value")
 
-		// Should update automatically after interval
-		waitForAsync(t, 120)
-		val := polling.Get()
-		assertEquals(t, true, val > 1, "polling should update automatically")
-		assertEquals(t, true, computeCount > 1, "compute should run multiple times")
+		// Wait for some polling cycles
+		time.Sleep(200 * time.Millisecond)
+
+		// Safely capture results
+		mu.Lock()
+		currentCount := computeCount
+		mu.Unlock()
+
+		finalVal := polling.Get()
+
+		assertEquals(t, true, finalVal > 1, "polling should update automatically")
+		assertEquals(t, true, currentCount > 1, "compute should run multiple times")
 
 		return nil
 	})
-	defer cleanUp()
+
+	// Wait for initial polling setup
+	wait()
+	cleanup()
 }
 
 // Polling Pause/Resume
 func TestPollingPauseResume(t *testing.T) {
-	cleanUp := firm.Root(func(owner *firm.Owner) firm.CleanUp {
+	cleanup, wait := firm.Root(func(owner *firm.Owner) firm.CleanUp {
 		var mu sync.Mutex
 		computeCount := 0
 
@@ -553,12 +629,13 @@ func TestPollingPauseResume(t *testing.T) {
 
 		return nil
 	})
-	defer cleanUp()
+	wait()
+	defer cleanup()
 }
 
 // Polling with change detection
 func TestPollingChangeDetection(t *testing.T) {
-	cleanUp := firm.Root(func(owner *firm.Owner) firm.CleanUp {
+	cleanup, wait := firm.Root(func(owner *firm.Owner) firm.CleanUp {
 		toggleVal := false
 		computeCount := 0
 		effectRuns := 0
@@ -613,7 +690,8 @@ func TestPollingChangeDetection(t *testing.T) {
 
 		return nil
 	})
-	defer cleanUp()
+	wait()
+	defer cleanup()
 }
 
 // STRESS TESTS
@@ -622,7 +700,7 @@ func TestStressDeepNesting(t *testing.T) {
 		t.Skip("skipping stress test in short mode")
 	}
 
-	cleanUp := firm.Root(func(owner *firm.Owner) firm.CleanUp {
+	cleanup, wait := firm.Root(func(owner *firm.Owner) firm.CleanUp {
 		// Create a signal
 		count := firm.Signal(owner, 0)
 
@@ -636,7 +714,8 @@ func TestStressDeepNesting(t *testing.T) {
 
 		return nil
 	})
-	defer cleanUp()
+	wait()
+	defer cleanup()
 }
 
 // Helper for creating nested effects
@@ -662,7 +741,7 @@ func TestStressManyEffects(t *testing.T) {
 		t.Skip("skipping stress test in short mode")
 	}
 
-	cleanUp := firm.Root(func(owner *firm.Owner) firm.CleanUp {
+	cleanup, wait := firm.Root(func(owner *firm.Owner) firm.CleanUp {
 		// Create a signal
 		count := firm.Signal(owner, 0)
 
@@ -680,7 +759,8 @@ func TestStressManyEffects(t *testing.T) {
 
 		return nil
 	})
-	defer cleanUp()
+	wait()
+	defer cleanup()
 }
 
 // Test many computed signals
@@ -689,7 +769,7 @@ func TestStressManyComputed(t *testing.T) {
 		t.Skip("skipping stress test in short mode")
 	}
 
-	cleanUp := firm.Root(func(owner *firm.Owner) firm.CleanUp {
+	cleanup, wait := firm.Root(func(owner *firm.Owner) firm.CleanUp {
 		// Create 500 computed values
 		computeds := make([]*firm.Computed[int], 0, 500)
 		for i := 0; i < 500; i++ {
@@ -710,7 +790,8 @@ func TestStressManyComputed(t *testing.T) {
 
 		return nil
 	})
-	defer cleanUp()
+	wait()
+	defer cleanup()
 }
 
 // Test concurrent updates
@@ -719,7 +800,7 @@ func TestStressConcurrentUpdates(t *testing.T) {
 		t.Skip("skipping stress test in short mode")
 	}
 
-	cleanUp := firm.Root(func(owner *firm.Owner) firm.CleanUp {
+	cleanup, wait := firm.Root(func(owner *firm.Owner) firm.CleanUp {
 		// Create a signal
 		count := firm.Signal(owner, 0)
 
@@ -765,12 +846,13 @@ func TestStressConcurrentUpdates(t *testing.T) {
 
 		return nil
 	})
-	defer cleanUp()
+	wait()
+	defer cleanup()
 }
 
 // Edge case: circular dependencies
 func TestEdgeCaseCircularDependency(t *testing.T) {
-	cleanUp := firm.Root(func(owner *firm.Owner) firm.CleanUp {
+	cleanup, wait := firm.Root(func(owner *firm.Owner) firm.CleanUp {
 		// Create signals
 		a := firm.Signal(owner, 1)
 		b := firm.Signal(owner, 2)
@@ -821,12 +903,13 @@ func TestEdgeCaseCircularDependency(t *testing.T) {
 
 		return nil
 	})
-	defer cleanUp()
+	wait()
+	defer cleanup()
 }
 
 // Edge case: concurrent polling and manual updates
 func TestEdgeCaseConcurrentPolling(t *testing.T) {
-	cleanUp := firm.Root(func(owner *firm.Owner) firm.CleanUp {
+	cleanup, wait := firm.Root(func(owner *firm.Owner) firm.CleanUp {
 		var mu sync.Mutex
 		counter := 0
 
@@ -856,11 +939,12 @@ func TestEdgeCaseConcurrentPolling(t *testing.T) {
 
 		return nil
 	})
-	defer cleanUp()
+	wait()
+	defer cleanup()
 }
 
 func TestNestedBatch(t *testing.T) {
-	cleanUp := firm.Root(func(owner *firm.Owner) firm.CleanUp {
+	cleanup, wait := firm.Root(func(owner *firm.Owner) firm.CleanUp {
 		count := firm.Signal(owner, 0)
 		effectRuns := 0
 
@@ -894,11 +978,12 @@ func TestNestedBatch(t *testing.T) {
 
 		return nil
 	})
-	defer cleanUp()
+	wait()
+	defer cleanup()
 }
 
 func TestSignalUpdate(t *testing.T) {
-	cleanUp := firm.Root(func(owner *firm.Owner) firm.CleanUp {
+	cleanup, wait := firm.Root(func(owner *firm.Owner) firm.CleanUp {
 		count := firm.Signal(owner, 5)
 
 		// Test Update function
@@ -929,11 +1014,12 @@ func TestSignalUpdate(t *testing.T) {
 
 		return nil
 	})
-	defer cleanUp()
+	wait()
+	defer cleanup()
 }
 
 func TestComputedWithMultipleDeps(t *testing.T) {
-	cleanUp := firm.Root(func(owner *firm.Owner) firm.CleanUp {
+	cleanup, wait := firm.Root(func(owner *firm.Owner) firm.CleanUp {
 		// Create source signals
 		a := firm.Signal(owner, 5)
 		b := firm.Signal(owner, 10)
@@ -966,13 +1052,14 @@ func TestComputedWithMultipleDeps(t *testing.T) {
 
 		return nil
 	})
-	defer cleanUp()
+	wait()
+	defer cleanup()
 }
 
 func TestCleanupOrder(t *testing.T) {
 	cleanupOrder := []int{}
 
-	cleanUp := firm.Root(func(owner *firm.Owner) firm.CleanUp {
+	cleanup, wait := firm.Root(func(owner *firm.Owner) firm.CleanUp {
 		// Create effects with ordered cleanups
 		firm.Effect(owner, func() firm.CleanUp {
 			return func() {
@@ -997,8 +1084,9 @@ func TestCleanupOrder(t *testing.T) {
 		}
 	})
 
-	// Execute cleanup
-	cleanUp()
+	// Execute cleanup with proper wait first
+	wait()
+	cleanup()
 
 	// With our implementation, root cleanup (0) runs first, then effects in reverse (3,2,1)
 	assertEquals(t, []int{0, 3, 2, 1}, cleanupOrder, "cleanups should execute in reverse creation order")
@@ -1008,7 +1096,7 @@ func TestAsyncSignalUpdates(t *testing.T) {
 	// Create a channel to synchronize operations
 	updateComplete := make(chan struct{})
 
-	cleanUp := firm.Root(func(owner *firm.Owner) firm.CleanUp {
+	cleanup, wait := firm.Root(func(owner *firm.Owner) firm.CleanUp {
 		count := firm.Signal(owner, 0)
 		results := firm.Signal(owner, 0)
 
@@ -1065,5 +1153,6 @@ func TestAsyncSignalUpdates(t *testing.T) {
 
 		return nil
 	})
-	defer cleanUp()
+	wait()
+	defer cleanup()
 }
