@@ -118,6 +118,9 @@ Computed values are derived from other reactive values:
 
 ```go
 // Create a memo (computed value) from other signals
+count := firm.Signal(owner, 5)
+
+// Memo with automatic dependency tracking (nil)
 doubled := firm.Memo(owner, func() int {
     return count.Get() * 2
 }, nil) // nil means auto-track dependencies
@@ -125,14 +128,14 @@ doubled := firm.Memo(owner, func() int {
 // Read the computed value
 fmt.Println("Doubled:", doubled.Get())
 
-// A more complex example with multiple dependencies
+// A more complex example with explicit dependencies
 count := firm.Signal(owner, 5)
 multiplier := firm.Signal(owner, 2)
 
-// This memo tracks both count and multiplier
+// This memo explicitly lists its dependencies
 product := firm.Memo(owner, func() int {
     return count.Get() * multiplier.Get()
-}, nil)
+}, []firm.Reactive{count, multiplier})  // Explicitly list dependencies
 
 firm.Effect(owner, func() firm.CleanUp {
     fmt.Printf("Product is now: %d\n", product.Get())
