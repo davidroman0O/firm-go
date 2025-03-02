@@ -1,49 +1,45 @@
 # Firm-Go
 
-A comprehensive library that brings Solid.js-style reactivity to Go, featuring signals, computed values, effects, resources, and stores.
+<div align="center">
+  <h3>Fine-grained Reactive State Management for Go</h3>
+  <p>A thread-safe, Solid.js-inspired reactive library for Go applications</p>
 
-> WORK IN PROGRESS: fr fr i'm just checking the concept and ideas for now
+  ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
+  ![Go Version](https://img.shields.io/badge/Go-1.18+-00ADD8.svg)
+  ![Status](https://img.shields.io/badge/Status-Beta-yellow)
+</div>
 
-## Overview
+## 📚 Table of Contents
 
-Firm-Go is a Go library that implements a reactive programming model inspired by Solid.js. It provides primitives for creating and managing reactive state in Go applications in an idiomatic way.
+- [Introduction](#introduction)
+- [Installation](#installation)
+- [Core Concepts](#core-concepts)
+  - [Signals](#signals)
+  - [Effects](#effects)
+  - [Computed Values and Memos](#computed-values-and-memos)
+  - [Contexts](#contexts)
+  - [Resources](#resources)
+  - [Batching](#batching)
+  - [Polling](#polling)
+- [Usage Examples](#usage-examples)
+- [Concurrency & Safety](#concurrency--safety)
+- [Advanced Features](#advanced-features)
+- [API Reference](#api-reference)
+- [Best Practices](#best-practices)
 
-The core concepts include:
+## Introduction
 
-- **Signals**: Reactive values that notify subscribers when they change
-- **Computed**: Derived values that automatically update when their dependencies change
-- **Memo**: Optimized computed values with custom equality functions
-- **Effects**: Side effects that run when their dependencies change
-- **Resources**: Async data fetching with loading/error states
-- **Stores**: Reactive objects with nested updates
-- **Contexts**: Scoped reactivity with cleanup
-- **Derived Signals**: Two-way bindable derived state
-- **Accessors**: Getter/setter combined functions (like in Solid.js)
+**Firm-Go** is a reactive state management library for Go applications inspired by [Solid.js](https://www.solidjs.com/). It enables building applications with fine-grained reactivity, automatic dependency tracking, and efficient update propagation - all while maintaining Go's type safety and concurrency model.
 
-## Features
+### Key Features
 
-- **Core Reactivity**
-  - Fine-grained dependency tracking
-  - Automatic subscription management
-  - Immutable update patterns
-  - Batch processing for efficient updates
-
-- **Type Safety**
-  - Generic type support for all reactive primitives
-  - Compile-time type checking
-
-- **Advanced Features**
-  - Resource management for async operations
-  - Context-based cleanup
-  - Nested path updates for complex state
-  - Middleware support for stores
-  - Two-way binding for derived values
-  - Custom equality functions
-
-- **Performance**
-  - Minimal re-computation through dependency tracking
-  - Batching to reduce update cascades
-  - Memoization with equality checks
+- **✅ Fine-grained reactivity**: Updates propagate efficiently through a dependency graph
+- **✅ Thread-safe**: All operations are protected by mutexes for concurrent Go applications
+- **✅ Type-safe**: Built with Go generics for compile-time type checking
+- **✅ Automatic cleanup**: Resources are automatically cleaned up when no longer needed
+- **✅ Batched updates**: Efficiently group related state changes
+- **✅ Async support**: First-class support for asynchronous operations with Resources
+- **✅ Reactive primitives**: Signals, Effects, Computed, Context, Resources and more
 
 ## Installation
 
@@ -51,21 +47,39 @@ The core concepts include:
 go get github.com/davidroman0O/firm-go
 ```
 
-## Usage
+## Core Concepts
+
+### Owner and Root
+
+Firm-Go uses the concept of an "Owner" to manage the lifecycle of reactive primitives. The `Root` function creates a new owner:
+
+```go
+cleanup := firm.Root(func(owner *firm.Owner) firm.CleanUp {
+    // Create signals, effects, etc. owned by this owner
+    
+    // Optional cleanup to run when root is disposed
+    return func() {
+        fmt.Println("Root disposed")
+    }
+})
+
+// Later, clean up all resources
+defer cleanup()
+```
 
 ### Signals
 
+Signals are the foundation of Firm-Go's reactivity. They hold values that can change over time:
+
 ```go
-import "github.com/davidroman0O/firm-go"
-
 // Create a signal with an initial value
-count := firm.NewSignal(0)
+count := firm.Signal(owner, 0)
 
-// Read the current value (tracks dependency)
+// Read the current value (tracks as dependency)
 value := count.Get()
 
-// Read without tracking (does not create dependency)
-untracked := count.Peek()
+// Read without tracking
+value := count.Peek()
 
 // Update the value
 count.Set(5)
@@ -74,571 +88,511 @@ count.Set(5)
 count.Update(func(current int) int {
     return current + 1
 })
-
-// Subscribe to changes
-unsubscribe := count.Subscribe(func(newValue int) {
-    fmt.Printf("Value changed to: %d\n", newValue)
-})
-
-// Stop receiving updates
-unsubscribe()
 ```
 
-### Computed Values
+### Effects
+
+Effects run side effects when their dependencies change:
 
 ```go
-import "github.com/davidroman0O/firm-go"
+// Effect with automatic dependency tracking
+firm.Effect(owner, func() firm.CleanUp {
+    fmt.Println("Count is now:", count.Get())
+    
+    // Return an optional cleanup function
+    return func() {
+        fmt.Println("Cleaning up after effect")
+    }
+}, nil) // nil means auto-track dependencies
 
-// Create signals
-x := firm.NewSignal(5)
-y := firm.NewSignal(10)
+// Effect with explicit dependencies
+firm.Effect(owner, func() firm.CleanUp {
+    fmt.Println("Count is now:", count.Get())
+    return nil
+}, []firm.Reactive{count})
+```
 
-// Create a computed value that depends on both signals
-sum := firm.NewComputed(func() int {
-    return x.Get() + y.Get()
+### Computed Values and Memos
+
+Computed values are derived from other reactive values:
+
+```go
+// Create a memo (computed value) from other signals
+doubled := firm.Memo(owner, func() int {
+    return count.Get() * 2
+}, nil) // nil means auto-track dependencies
+
+// Read the computed value
+fmt.Println("Doubled:", doubled.Get())
+
+// A more complex example with multiple dependencies
+count := firm.Signal(owner, 5)
+multiplier := firm.Signal(owner, 2)
+
+// This memo tracks both count and multiplier
+product := firm.Memo(owner, func() int {
+    return count.Get() * multiplier.Get()
+}, nil)
+
+firm.Effect(owner, func() firm.CleanUp {
+    fmt.Printf("Product is now: %d\n", product.Get())
+    return nil
+}, nil)
+
+// When either signal changes, the memo updates
+count.Set(10)      // Logs: "Product is now: 20"
+multiplier.Set(3)  // Logs: "Product is now: 30"
+```
+
+### Contexts
+
+Contexts provide a way to pass values down through a reactive system:
+
+```go
+// Create a context with a default value
+themeContext := firm.NewContext(owner, "light")
+
+// In a child component:
+firm.Effect(owner, func() firm.CleanUp {
+    // Get the current theme
+    theme := themeContext.Use()
+    fmt.Println("Current theme:", theme)
+    return nil
+}, nil)
+
+// Update the context
+themeContext.Set("dark")
+
+// Conditional rendering based on context
+themeContext.Match(owner, "dark", func(childOwner *firm.Owner) firm.CleanUp {
+    // This runs only when theme is "dark"
+    return nil
 })
 
-// The computed value automatically updates when dependencies change
-fmt.Println(sum.Get()) // 15
-x.Set(10)
-fmt.Println(sum.Get()) // 20
+// Conditional with custom matcher
+themeContext.When(owner, func(theme string) bool {
+    return theme == "light" || theme == "system"
+}, func(childOwner *firm.Owner) firm.CleanUp {
+    // This runs when theme is "light" or "system"
+    return nil
+})
+```
 
-// Peek at the value without tracking it as a dependency
-peekedValue := sum.Peek()
+### Resources
 
-// Force recomputation when needed (e.g., after untracked dependencies change)
-sum.ForceComputation()
+Resources handle asynchronous operations with built-in loading and error states:
+
+```go
+// Create a resource with an async fetcher
+userResource := firm.Resource(owner, func() (User, error) {
+    // Simulate API call
+    time.Sleep(100 * time.Millisecond)
+    return User{Name: "John", Age: 30}, nil
+})
+
+// Check loading state
+firm.Effect(owner, func() firm.CleanUp {
+    if userResource.Loading() {
+        fmt.Println("Loading user...")
+    } else if err := userResource.Error(); err != nil {
+        fmt.Println("Error loading user:", err)
+    } else {
+        user := userResource.Data()
+        fmt.Println("User loaded:", user.Name)
+    }
+    return nil
+}, []firm.Reactive{userResource})
+
+// Refresh data
+userResource.Refetch()
+
+// Run function when data loads
+userResource.OnLoad(func(data User, err error) {
+    if err != nil {
+        fmt.Println("Failed to load:", err)
+    } else {
+        fmt.Println("User loaded:", data.Name)
+    }
+})
+```
+
+### Batching
+
+Batch multiple updates to prevent cascading rerenders:
+
+```go
+firm.Batch(owner, func() {
+    // These updates will be batched together
+    firstName.Set("John")
+    lastName.Set("Doe")
+    age.Set(30)
+    // Effects will only run once after the batch completes
+})
+```
+
+### Polling
+
+Create values that automatically update on an interval:
+
+```go
+// Create a polling signal that updates every second
+timePolling := firm.NewPolling(owner, func() time.Time {
+    return time.Now()
+}, time.Second)
+
+// Use the polling value
+firm.Effect(owner, func() firm.CleanUp {
+    fmt.Println("Current time:", timePolling.Get().Format(time.RFC3339))
+    return nil
+}, []firm.Reactive{timePolling})
+
+// Control the polling
+timePolling.Pause()  // Stop polling
+timePolling.Resume() // Resume polling
+timePolling.SetInterval(time.Minute) // Change interval
+```
+
+## Usage Examples
+
+### Simple Counter
+
+```go
+cleanup := firm.Root(func(owner *firm.Owner) firm.CleanUp {
+    count := firm.Signal(owner, 0)
+    doubled := firm.Memo(owner, func() int {
+        return count.Get() * 2
+    }, nil)
+    
+    firm.Effect(owner, func() firm.CleanUp {
+        fmt.Printf("Count: %d, Doubled: %d\n", count.Get(), doubled.Get())
+        return nil
+    }, nil)
+    
+    // Simulate updates
+    count.Set(1)  // Logs: Count: 1, Doubled: 2
+    count.Set(2)  // Logs: Count: 2, Doubled: 4
+    
+    return nil
+})
+defer cleanup()
+```
+
+### Data Fetching with Resources
+
+```go
+cleanup := firm.Root(func(owner *firm.Owner) firm.CleanUp {
+    userId := firm.Signal(owner, 1)
+    
+    userResource := firm.Resource(owner, func() (User, error) {
+        id := userId.Get()
+        return fetchUserById(id) // Your API function
+    })
+    
+    firm.Effect(owner, func() firm.CleanUp {
+        if userResource.Loading() {
+            fmt.Println("Loading user...")
+        } else if err := userResource.Error(); err != nil {
+            fmt.Println("Error:", err)
+        } else {
+            user := userResource.Data()
+            fmt.Println("User:", user.Name)
+        }
+        return nil
+    }, []firm.Reactive{userResource})
+    
+    // Change user ID to trigger a new fetch
+    userId.Set(2)
+    
+    return nil
+})
+defer cleanup()
+```
+
+### Theme Context Example
+
+```go
+cleanup := firm.Root(func(owner *firm.Owner) firm.CleanUp {
+    theme := firm.NewContext(owner, "light")
+    
+    // Create UI with theme context
+    createUI := func(childOwner *firm.Owner) firm.CleanUp {
+        firm.Effect(childOwner, func() firm.CleanUp {
+            currentTheme := theme.Use()
+            fmt.Println("Rendering UI with theme:", currentTheme)
+            return nil
+        }, nil)
+        
+        return nil
+    }
+    
+    // Create UI initially
+    createUI(owner)
+    
+    // Change theme later
+    theme.Set("dark")
+    
+    return nil
+})
+defer cleanup()
+```
+
+## Concurrency & Safety
+
+Firm-Go is designed for concurrent Go applications. All operations are protected by mutexes:
+
+```go
+cleanup := firm.Root(func(owner *firm.Owner) firm.CleanUp {
+    count := firm.Signal(owner, 0)
+    
+    // Launch multiple goroutines updating the signal
+    var wg sync.WaitGroup
+    for i := 0; i < 10; i++ {
+        wg.Add(1)
+        go func() {
+            defer wg.Done()
+            // Atomic update of signal
+            count.Update(func(v int) int {
+                return v + 1
+            })
+        }()
+    }
+    
+    wg.Wait()
+    fmt.Println("Final count:", count.Get()) // Should be 10
+    
+    return nil
+})
+defer cleanup()
+```
+
+## Advanced Features
+
+### Derived Signals
+
+Create signals that derive from others with two-way binding:
+
+```go
+cleanup := firm.Root(func(owner *firm.Owner) firm.CleanUp {
+    user := firm.Signal(owner, User{Name: "John", Age: 30})
+    
+    // Create a derived signal for the name field
+    nameSignal := firm.DerivedSignal(
+        owner, 
+        user,
+        // Getter
+        func(u User) string {
+            return u.Name
+        },
+        // Setter
+        func(u User, name string) User {
+            u.Name = name
+            return u
+        },
+    )
+    
+    // Now nameSignal can be used as a regular signal
+    fmt.Println("Name:", nameSignal.Get())
+    
+    // Update via the derived signal
+    nameSignal.Set("Jane")
+    
+    // The original user signal is also updated
+    fmt.Println("User:", user.Get().Name) // "Jane"
+    
+    return nil
+})
+defer cleanup()
+```
+
+### Untracking Dependencies
+
+Sometimes you need to read signals without creating dependencies:
+
+```go
+firm.Effect(owner, func() firm.CleanUp {
+    // This creates a dependency
+    count := counter.Get()
+    
+    // This does not create a dependency
+    config := firm.Untrack(owner, func() Config {
+        return configSignal.Get()
+    })
+    
+    fmt.Printf("Count: %d, Config: %v\n", count, config)
+    return nil
+}, nil)
+```
+
+### Defer
+
+Create signals with delayed updates:
+
+```go
+cleanup := firm.Root(func(owner *firm.Owner) firm.CleanUp {
+    search := firm.Signal(owner, "")
+    
+    // Debounced search query - updates 300ms after the source
+    debouncedSearch := firm.Defer(owner, search, 300)
+    
+    firm.Effect(owner, func() firm.CleanUp {
+        // Only runs when the debounced value changes
+        query := debouncedSearch.Get()
+        if query != "" {
+            fmt.Println("Searching for:", query)
+            // performSearch(query)
+        }
+        return nil
+    }, nil)
+    
+    // These rapid updates only result in one search
+    search.Set("a")
+    search.Set("ap")
+    search.Set("app")
+    search.Set("appl")
+    search.Set("apple")
+    
+    return nil
+})
+defer cleanup()
+```
+
+## API Reference
+
+### Signal
+
+```go
+Signal[T](owner, initialValue) -> *signalImpl[T]
+  Methods:
+    Get() -> T                     // Get with dependency tracking
+    Peek() -> T                    // Get without tracking
+    Set(value T)                   // Set a new value
+    Update(fn func(T) T)           // Update functionally
+```
+
+### Effect
+
+```go
+Effect(owner, fn func() CleanUp, deps []Reactive)
 ```
 
 ### Memo
 
 ```go
-import "github.com/davidroman0O/firm-go"
-import "math"
-
-// Create a memo with custom equality function
-memo := firm.CreateMemo(
-    // Compute function
-    func() string {
-        return fmt.Sprintf("%s %s", firstName.Get(), lastName.Get())
-    },
-    // Equality function
-    func(a, b string) bool {
-        // Only update if the length difference is more than 2 characters
-        return math.Abs(float64(len(a) - len(b))) <= 2
-    },
-)
-
-// Memo behaves like a computed but skips updates when the equality function returns true
+Memo[T](owner, compute func() T, deps []Reactive) -> *signalImpl[T]
 ```
 
-### Effects
+### Computed
 
 ```go
-import "github.com/davidroman0O/firm-go"
-
-// Create a signal
-message := firm.NewSignal("Hello")
-
-// Create an effect that runs when the signal changes
-effect := firm.CreateEffect(func() {
-    fmt.Println("Message changed:", message.Get())
-    
-    // Register cleanup function
-    firm.OnCleanup(func() {
-        fmt.Println("Cleaning up effect")
-    })
-})
-
-// Updating the signal triggers the effect
-message.Set("World")
-
-// Dispose the effect when no longer needed
-effect.Dispose()
+NewComputed[T](owner, compute func() T) -> *Computed[T]
+  Methods:
+    Get() -> T                     // Get the computed value
+    Recompute() -> bool            // Force recomputation
 ```
 
-### Batching Updates
+### Batch
 
 ```go
-import "github.com/davidroman0O/firm-go"
-
-firm.Batch(func() {
-    // Multiple updates are batched into a single notification
-    count.Set(1)
-    count.Set(2)
-    count.Set(3)
-    // Only the final value (3) will trigger effects
-})
+Batch(owner, fn func())
 ```
 
-### Untracked Reads
+### Context
 
 ```go
-import "github.com/davidroman0O/firm-go"
-
-// Create a computed value with mixed tracking
-mixed := firm.NewComputed(func() int {
-    // This is tracked - changes will trigger recomputation
-    aValue := a.Get()
-    
-    // This is not tracked - changes won't trigger recomputation
-    bValue := firm.Untrack(func() int {
-        return b.Get()
-    })
-    
-    return aValue + bValue
-})
-
-// After an untracked dependency changes, you might need to force recomputation
-b.Set(20) // This won't trigger recomputation
-mixed.ForceComputation() // Manually trigger recomputation to see latest b value
+NewContext[T](owner, defaultValue) -> *Context[T]
+  Methods:
+    Use() -> T                     // Get context value with tracking
+    Set(value T)                   // Update context value
+    Match(owner, value, fn) -> CleanUp // Run when value matches exactly
+    When(owner, matcher, fn) -> CleanUp // Run when matcher returns true
 ```
 
-### Resources
+### Resource
 
 ```go
-import "github.com/davidroman0O/firm-go"
-import "time"
-
-// Create a resource with an async fetcher
-userResource := firm.CreateResource(func() (User, error) {
-    // Simulate an API call
-    time.Sleep(100 * time.Millisecond)
-    return User{Name: "John", Age: 30}, nil
-})
-
-// Check if the resource is loading
-if userResource.Loading() {
-    fmt.Println("Loading user data...")
-}
-
-// Check for errors
-if err := userResource.Error(); err != nil {
-    fmt.Println("Error loading user:", err)
-}
-
-// Access the data
-user := userResource.Data()
-fmt.Println("User:", user.Name)
-
-// Manually trigger a refetch
-userResource.Refetch()
+Resource[T](owner, fetcher func() (T, error)) -> *resourceImpl[T]
+  Methods:
+    Loading() -> bool              // Check if loading
+    Data() -> T                    // Get data
+    Error() -> error               // Get error
+    Refetch()                      // Fetch again
+    OnLoad(fn func(T, error))      // Run when load completes
 ```
 
-### Reactive Store
+### Polling
 
 ```go
-import "github.com/davidroman0O/firm-go"
-
-// Create a store with initial state
-userStore := firm.CreateStore(User{
-    Name: "John",
-    Age:  30,
-    Address: Address{
-        Street: "123 Main St",
-        City:   "Anytown",
-    },
-})
-
-// Get the current state
-user := userStore.Get()
-
-// Set the entire state
-userStore.Set(User{Name: "Jane", Age: 25})
-
-// Update a specific path
-userStore.SetPath([]string{"Name"}, "Bob")
-
-// Update a nested path
-userStore.SetPath([]string{"Address", "City"}, "Newtown")
-
-// Add middleware
-userStore.Use(func(path []string, value any, oldValue any) any {
-    fmt.Printf("Updating path %v: %v -> %v\n", path, oldValue, value)
-    return value // Return the value (possibly modified)
-})
+NewPolling[T](owner, compute func() T, interval) -> *Polling[T]
+  Methods:
+    Get() -> T                     // Get current value
+    SetInterval(interval)          // Change polling interval
+    Pause()                        // Pause polling
+    Resume()                       // Resume polling
 ```
-
-### Context Management
-
-```go
-import "github.com/davidroman0O/firm-go"
-
-// Create a root context
-dispose := firm.CreateRoot(func() {
-    // Signals and effects created here will be automatically disposed
-    count := firm.NewSignal(0)
-    
-    firm.CreateEffect(func() {
-        fmt.Println("Count:", count.Get())
-    })
-    
-    // Register cleanup
-    firm.OnCleanup(func() {
-        fmt.Println("Cleaning up resources")
-    })
-})
-
-// Dispose the context and clean up all resources
-dispose()
-```
-
-### Accessor API
-
-```go
-import "github.com/davidroman0O/firm-go"
-
-// Create an accessor (similar to Solid's createSignal)
-count := firm.NewAccessor(0)
-
-// Use as getter
-value := count.Call().(int)
-
-// Use as setter
-count.Call(10)
-
-// Can be used in computed values too
-doubled := firm.NewComputed(func() int {
-    return count.Call().(int) * 2
-})
-```
-
-### Derived Signals
-
-```go
-import "github.com/davidroman0O/firm-go"
-
-// Create a base signal
-user := firm.NewSignal(User{Name: "John", Age: 30})
-
-// Create a selector for a specific property
-nameSignal := firm.Selector(user, func(u User) string {
-    return u.Name
-})
-
-// Create a two-way derived signal
-ageSignal := firm.NewDerivedSignal(
-    user,
-    // Getter
-    func(u User) int {
-        return u.Age
-    },
-    // Setter
-    func(u User, newAge int) User {
-        u.Age = newAge
-        return u
-    },
-)
-
-// Use the derived signal
-fmt.Println("Age:", ageSignal.Get())
-ageSignal.Set(40) // Updates the original signal
-```
-
-## Real-World Example
-
-Here's a more complete example showing how these concepts work together:
-
-```go
-package main
-
-import (
-	"fmt"
-	"time"
-	"github.com/davidroman0O/firm-go"
-)
-
-type TodoItem struct {
-	ID        int
-	Text      string
-	Completed bool
-}
-
-func main() {
-	// Create a store for our todo list
-	todoStore := firm.CreateStore([]TodoItem{
-		{ID: 1, Text: "Learn Go", Completed: true},
-		{ID: 2, Text: "Learn Firm-Go", Completed: false},
-	})
-	
-	// Computed for active todos
-	activeTodos := firm.NewComputed(func() []TodoItem {
-		todos := todoStore.Get()
-		result := make([]TodoItem, 0)
-		for _, todo := range todos {
-			if !todo.Completed {
-				result = append(result, todo)
-			}
-		}
-		return result
-	})
-	
-	// Computed for completed todos
-	completedTodos := firm.NewComputed(func() []TodoItem {
-		todos := todoStore.Get()
-		result := make([]TodoItem, 0)
-		for _, todo := range todos {
-			if todo.Completed {
-				result = append(result, todo)
-			}
-		}
-		return result
-	})
-	
-	// Effect to log changes
-	firm.CreateEffect(func() {
-		todos := todoStore.Get()
-		active := len(activeTodos.Get())
-		completed := len(completedTodos.Get())
-		fmt.Printf("Todos: %d total, %d active, %d completed\n", 
-			len(todos), active, completed)
-	})
-	
-	// Function to add a todo
-	addTodo := func(text string) {
-		todos := todoStore.Get()
-		newID := len(todos) + 1
-		todoStore.Set(append(todos, TodoItem{
-			ID:        newID,
-			Text:      text,
-			Completed: false,
-		}))
-	}
-	
-	// Function to toggle a todo
-	toggleTodo := func(id int) {
-		todos := todoStore.Get()
-		for i, todo := range todos {
-			if todo.ID == id {
-				// Create a new array with the updated item
-				newTodos := make([]TodoItem, len(todos))
-				copy(newTodos, todos)
-				newTodos[i].Completed = !newTodos[i].Completed
-				todoStore.Set(newTodos)
-				break
-			}
-		}
-	}
-	
-	// Add some todos
-	addTodo("Build an app")
-	
-	// Toggle a todo
-	toggleTodo(2)
-	
-	// Access the computed values
-	fmt.Println("\nActive todos:")
-	for _, todo := range activeTodos.Get() {
-		fmt.Printf("- %s\n", todo.Text)
-	}
-	
-	fmt.Println("\nCompleted todos:")
-	for _, todo := range completedTodos.Get() {
-		fmt.Printf("- %s\n", todo.Text)
-	}
-	
-	// Create a resource that fetches todos from a server
-	todoResource := firm.CreateResource(func() ([]TodoItem, error) {
-		// Simulating an API call
-		time.Sleep(100 * time.Millisecond)
-		return []TodoItem{
-			{ID: 100, Text: "Remote todo 1", Completed: false},
-			{ID: 101, Text: "Remote todo 2", Completed: true},
-		}, nil
-	})
-	
-	// Wait for the resource to load
-	time.Sleep(200 * time.Millisecond)
-	
-	// Check the resource
-	if todoResource.Loading() {
-		fmt.Println("\nStill loading remote todos...")
-	} else if err := todoResource.Error(); err != nil {
-		fmt.Println("\nError loading remote todos:", err)
-	} else {
-		fmt.Println("\nRemote todos loaded:")
-		for _, todo := range todoResource.Data() {
-			fmt.Printf("- %s (Completed: %v)\n", todo.Text, todo.Completed)
-		}
-	}
-}
-```
-
-## Important Concepts
-
-### Dependency Tracking
-
-Firm-Go automatically tracks dependencies when you call `.Get()` on a signal. Any computed value or effect that reads a signal will automatically re-run when that signal changes.
-
-### Untracked Dependencies
-
-Sometimes you need to read a signal without creating a dependency. Use the `Untrack` function or `Peek()` method for this:
-
-```go
-// Read a value without creating a dependency
-untracked := firm.Untrack(func() {
-    return signal.Get()
-})
-
-// Or use Peek
-value := signal.Peek()
-```
-
-**Important Note**: When using untracked dependencies, changes to those dependencies won't automatically trigger recomputation. If you need to force a recomputation to see the latest values, use `ForceComputation()`:
-
-```go
-// Force a computed value to recompute using the latest values
-myComputed.ForceComputation()
-```
-
-## Advanced Patterns
-
-### Composing Reactive Logic
-
-You can create custom reactive primitives by composing the basic building blocks:
-
-```go
-import "github.com/davidroman0O/firm-go"
-
-// Create a custom reactive counter with increment/decrement methods
-type Counter struct {
-	value   *firm.Signal[int]
-	doubled *firm.Computed[int]
-}
-
-func NewCounter(initial int) *Counter {
-	value := firm.NewSignal(initial)
-	
-	doubled := firm.NewComputed(func() int {
-		return value.Get() * 2
-	})
-	
-	return &Counter{
-		value: value,
-		doubled: doubled,
-	}
-}
-
-func (c *Counter) Get() int {
-	return c.value.Get()
-}
-
-func (c *Counter) Doubled() int {
-	return c.doubled.Get()
-}
-
-func (c *Counter) Increment() {
-	c.value.Update(func(v int) int {
-		return v + 1
-	})
-}
-
-func (c *Counter) Decrement() {
-	c.value.Update(func(v int) int {
-		return v - 1
-	})
-}
-```
-
-### Reactive Forms
-
-```go
-import "github.com/davidroman0O/firm-go"
-
-type FormState struct {
-	Values     map[string]string
-	Errors     map[string]string
-	Touched    map[string]bool
-	Submitting bool
-}
-
-func CreateForm(initialValues map[string]string) *firm.Store[FormState] {
-	return firm.CreateStore(FormState{
-		Values:     initialValues,
-		Errors:     make(map[string]string),
-		Touched:    make(map[string]bool),
-		Submitting: false,
-	})
-}
-
-// Usage
-form := CreateForm(map[string]string{"email": "", "password": ""})
-
-// Set a field value
-form.SetPath([]string{"Values", "email"}, "user@example.com")
-
-// Mark as touched
-form.SetPath([]string{"Touched", "email"}, true)
-
-// Set validation error
-form.SetPath([]string{"Errors", "email"}, "Invalid email format")
-
-// Create a computed for form validity
-isValid := firm.NewComputed(func() bool {
-	state := form.Get()
-	return len(state.Errors) == 0
-})
-```
-
-## Performance Considerations
-
-- **Use Peek/GetUntracked** when you need to read a signal without creating a dependency
-- **Use Batch** when making multiple updates to avoid cascading reactions
-- **Use Memo** with custom equality functions to prevent unnecessary updates
-- **Use ForceComputation** when you need to refresh computed values after untracked dependencies change
-- **Dispose** effects and contexts when they're no longer needed
-- **Use Resources** for asynchronous operations to manage loading states
-
-## Thread Safety
-
-Firm-Go uses mutexes to provide thread safety for basic operations. However, complex state updates should be batched to avoid race conditions and ensure consistency.
-
-## Differences from Solid.js
-
-While Firm-Go aims to provide a similar API to Solid.js, there are some differences due to the nature of Go:
-
-1. **Static Typing**: Firm-Go uses generics for type safety
-2. **Garbage Collection**: Go's garbage collection means we need explicit disposal for cleanup
-3. **Concurrency Model**: Go's goroutines require thread-safe reactivity primitives
-4. **Error Handling**: Resources in Firm-Go explicitly handle errors
-5. **Manual Recomputation**: Sometimes you need to manually force recomputation with `ForceComputation()`
-
-## Limitations
-
-- This library is primarily designed for state management
-- Complex nested updates in stores may not be as ergonomic as in JavaScript
-- Go's type system sometimes requires more verbose code than Solid.js
 
 ## Best Practices
 
-1. **Use signals for primitive values** that change frequently
-2. **Use computed values for derived state** rather than duplicating logic
-3. **Use effects for side effects** like logging or API calls
-4. **Use stores for complex objects** with nested properties
-5. **Use resources for async operations** to track loading and error states
-6. **Use batching for multiple updates** to avoid cascading updates
-7. **Use untracking judiciously** for optimization
-8. **Use ForceComputation when needed** for untracked dependencies
-9. **Clean up effects and contexts** to avoid memory leaks
+### Memory Management
 
-## Common Pitfalls
+Always call cleanup functions to prevent memory leaks:
 
-1. **Circular dependencies** between computed values can cause stack overflows
-2. **Forgetting to dispose effects** can lead to memory leaks
-3. **Mutating objects directly** instead of using signals or stores
-4. **Not forcing computation** when using untracked dependencies
-5. **Overusing effects** for derived state instead of computed values
+```go
+cleanup := firm.Root(func(owner *firm.Owner) firm.CleanUp {
+    // Your reactive code
+    return nil
+})
+defer cleanup() // Important!
+```
 
-## Future Improvements
+### Batch Updates for Performance
 
-- **Optimized Dependency Tracking**: More efficient tracking of dependencies
-- **Better Context API**: More powerful context propagation
-- **Debugging Tools**: Better visualization of reactive dependencies
+Use batching for multiple related updates:
 
-## Contributing
+```go
+firm.Batch(owner, func() {
+    firstName.Set("John")
+    lastName.Set("Doe")
+    email.Set("john.doe@example.com")
+})
+```
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+### Minimize Dependency Tracking
+
+Use `Peek()` when you don't need reactivity:
+
+```go
+// This creates a dependency - effect will rerun when configSignal changes
+config := configSignal.Get()
+
+// This doesn't create a dependency
+config := configSignal.Peek()
+```
+
+### Clean Up Resources
+
+Always return cleanup functions from effects that create resources:
+
+```go
+firm.Effect(owner, func() firm.CleanUp {
+    connection := openConnection(url.Get())
+    
+    return func() {
+        connection.Close() // Runs when effect reruns or owner is disposed
+    }
+}, nil)
+```
+
+### Use Explicit Dependencies When Possible
+
+For performance and clarity, specify explicit dependencies when known:
+
+```go
+firm.Effect(owner, func() firm.CleanUp {
+    fmt.Println("User:", firstName.Get(), lastName.Get())
+    return nil
+}, []firm.Reactive{firstName, lastName})
+```
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+MIT License
