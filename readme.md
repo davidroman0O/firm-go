@@ -260,7 +260,7 @@ cleanup, wait := firm.Root(func(owner *firm.Owner) firm.CleanUp {
     count := firm.Signal(owner, 0)
     doubled := firm.Memo(owner, func() int {
         return count.Get() * 2
-    }, nil)
+    }, nil) // auto-tracking on ANY change - you should use `[]firm.Reactive{count}` 
     
     firm.Effect(owner, func() firm.CleanUp {
         fmt.Printf("Count: %d, Doubled: %d\n", count.Get(), doubled.Get())
