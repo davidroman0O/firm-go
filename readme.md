@@ -1,3 +1,5 @@
+Here's the updated README.md with the StreamSignal feature added:
+
 # Firm-Go
 
 <div align="center">
@@ -21,6 +23,7 @@
   - [Computed Values and Memos](#computed-values-and-memos)
   - [Contexts](#contexts)
   - [Resources](#resources)
+  - [Streaming Data](#streaming-data)
   - [Batching](#batching)
   - [Async Operations](#async-operations)
   - [Polling](#polling)
@@ -42,6 +45,7 @@
 - **✅ Batched updates**: Efficiently group related state changes
 - **✅ Async support**: First-class support for asynchronous operations with WaitGroups
 - **✅ Reactive primitives**: Signals, Effects, Computed, Context, Resources and more
+- **✅ Streaming data**: Create signals from continuous data sources like CLI output, websockets, or events
 
 ## Installation
 
@@ -189,6 +193,37 @@ firm.Effect(owner, func() firm.CleanUp {
 userResource.Refetch()
 ```
 
+### Streaming Data
+
+Create signals that update from continuous data sources like CLI output, WebSockets, or events:
+
+```go
+// Create a signal from a continuous data source
+output := firm.StreamSignal(owner, "", func(set func(string), done func()) {
+    // Start a command or open a connection
+    cmd := exec.Command("ping", "-c", "5", "example.com")
+    stdout, _ := cmd.StdoutPipe()
+    cmd.Start()
+    
+    // Read and update the signal with each line
+    scanner := bufio.NewScanner(stdout)
+    for scanner.Scan() {
+        set(scanner.Text())
+    }
+    
+    // Mark as done when finished
+    cmd.Wait()
+    done()
+})
+
+// Use the streaming data like any other signal
+firm.Effect(owner, func() firm.CleanUp {
+    line := output.Get()
+    fmt.Println("Output:", line)
+    return nil
+}, []firm.Reactive{output})
+```
+
 ### Batching
 
 Batch multiple updates to prevent cascading rerenders:
@@ -308,6 +343,53 @@ cleanup, wait := firm.Root(func(owner *firm.Owner) firm.CleanUp {
 })
 
 // Wait for all async operations (including fetches)
+wait()
+defer cleanup()
+```
+
+### WebSocket Stream Example
+
+```go
+cleanup, wait := firm.Root(func(owner *firm.Owner) firm.CleanUp {
+    // Create a signal from a WebSocket connection
+    messages := firm.StreamSignal(owner, "", func(set func(string), done func()) {
+        conn, _, err := websocket.DefaultDialer.Dial("ws://example.com/socket", nil)
+        if err != nil {
+            fmt.Println("Error connecting:", err)
+            done()
+            return
+        }
+        defer conn.Close()
+        
+        // Read messages until connection closes
+        for {
+            _, message, err := conn.ReadMessage()
+            if err != nil {
+                fmt.Println("Error reading:", err)
+                break
+            }
+            
+            // Update signal with each new message
+            set(string(message))
+        }
+        
+        done()
+    })
+    
+    // Process incoming messages
+    firm.Effect(owner, func() firm.CleanUp {
+        msg := messages.Get()
+        if msg != "" {
+            fmt.Println("Received message:", msg)
+            // Process message here
+        }
+        return nil
+    }, []firm.Reactive{message})
+    
+    return nil
+})
+
+// Wait for stream to complete
 wait()
 defer cleanup()
 ```
@@ -486,6 +568,12 @@ Resource[T](owner, fetcher func() (T, error)) -> *resourceImpl[T]
     Error() -> error               // Get error
     Refetch()                      // Fetch again
     OnLoad(fn func(T, error))      // Run when load completes
+```
+
+### StreamSignal
+
+```go
+StreamSignal[T](owner, initialValue T, setup func(set func(T), done func())) -> *signalImpl[T]
 ```
 
 ### Owner

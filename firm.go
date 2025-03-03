@@ -1013,6 +1013,62 @@ func (c *Computed[T]) getNode() *node {
 	return c.value.getNode()
 }
 
+// StreamSignal creates a signal that's updated by a setter function in a continuous process
+func StreamSignal[T any](
+	owner *Owner,
+	initialValue T,
+	setup func(set func(T), done func()),
+) *signalImpl[T] {
+	// Create signal with initial value
+	signal := Signal(owner, initialValue)
+
+	// Flag to track if the stream is active
+	var mu deadlock.Mutex
+	active := true
+
+	// Track as pending operation
+	owner.TrackPendingOp()
+
+	// Create a done function to call when complete
+	done := func() {
+		mu.Lock()
+		defer mu.Unlock()
+
+		if active {
+			active = false
+			owner.CompletePendingOp()
+		}
+	}
+
+	// Create a setter function
+	setter := func(value T) {
+		mu.Lock()
+		isActive := active
+		mu.Unlock()
+
+		if isActive {
+			signal.Set(value)
+		}
+	}
+
+	// Start the setup function in a goroutine
+	go func() {
+		defer done() // Ensure we mark as complete even on panic
+
+		// Call the user's setup function with the setter
+		setup(setter, done)
+	}()
+
+	// Register cleanup
+	owner.mu.Lock()
+	owner.cleanups = append(owner.cleanups, func() {
+		done() // Mark as complete during cleanup
+	})
+	owner.mu.Unlock()
+
+	return signal
+}
+
 // Polling is a computed signal that refreshes on a timer
 type Polling[T any] struct {
 	*Computed[T]
